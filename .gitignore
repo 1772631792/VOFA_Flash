@@ -1,0 +1,30 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+pip-wheel-metadata/
+
+# ---- 打包 / 构建产物（本项目直接跑源码，不需要打包）----
+build/
+dist/
+*.spec
+
+# ---- 编辑器与系统 ----
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- 运行产物 ----
+*.log
+*.tmp
+*.bak
