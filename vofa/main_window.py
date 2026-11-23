@@ -43,7 +43,7 @@ from .icons import app_icon, icon
 from .plot_widget import MAX_CHANNELS, PlotPage
 from .protocol import JustFloatParser
 from .serial_worker import SerialWorker
-from .theme import APP_STYLE, CHANNEL_COLORS
+from .theme import APP_STYLE, CHANNEL_COLORS, GROUP_COLORS
 from .transport import (
     BaseTransport,
     TcpClientTransport,
@@ -53,7 +53,6 @@ from .transport import (
 
 ENGINES = ["JustFloat", "RawData"]
 INTERFACES = ["模拟模式", "串口", "UDP", "TCP客户端", "TCP服务端"]
-GROUP_COLORS = ["#2D7EF1", "#17B283", "#9B6DFF", "#FF9C3D", "#00B9C7", "#EF5350"]
 
 
 def vbox(margins=(0, 0, 0, 0), spacing=8):
@@ -328,7 +327,7 @@ class MainWindow(QMainWindow):
         self._update_channel_rows()
 
         self.statusBar().showMessage(
-            "就绪 · 模拟模式运行中，可直接发送命令；选择串口并连接后收发真实数据"
+            "就绪 · 已进入模拟模式，点击右上角「模拟模式」运行模拟数据，命令随时可发"
         )
 
         self.timer = QTimer(self)
@@ -482,9 +481,9 @@ class MainWindow(QMainWindow):
         lay.addStretch(1)
 
         self.mode_tag = QPushButton("● 模拟模式")
-        self.mode_tag.setObjectName("green")
+        self.mode_tag.setObjectName("primary")
         self.mode_tag.setFixedWidth(112)
-        self.mode_tag.setToolTip("点击在模拟模式与串口之间切换")
+        self.mode_tag.setToolTip("点击开始 / 暂停模拟数据流")
         self.mode_tag.clicked.connect(self.toggle_demo)
         lay.addWidget(self.mode_tag)
 
@@ -583,7 +582,6 @@ class MainWindow(QMainWindow):
         plot_l.addWidget(self.plot_stack, 1)
 
         self.pages: list[PlotPage] = []
-        self._create_page()
 
         # 信息栏
         self.info_bar = QWidget()
@@ -623,13 +621,23 @@ class MainWindow(QMainWindow):
         info_l.addStretch(1)
 
         self.auto_label = QPushButton("Auto")
-        self.auto_label.setObjectName("flatTool")
+        self.auto_label.setObjectName("autoBtn")
         self.auto_label.setStyleSheet(
-            "font-size:18px;font-style:italic;color:#2C2C2C;font-weight:700;"
+            "QPushButton#autoBtn {"
+            "  font-size:17px; font-style:italic; font-weight:800;"
+            "  color:#9AA8B8; background:transparent; border:1px solid transparent;"
+            "  border-radius:7px; padding:2px 12px;"
+            "}"
+            "QPushButton#autoBtn:hover { color:#2D7EF1; background:#EEF5FF; }"
+            "QPushButton#autoBtn:checked {"
+            "  color:#2D7EF1; background:#E8F1FF; border-color:#CFE0F8;"
+            "}"
         )
         self.auto_label.setCheckable(True)
         self.auto_label.setChecked(True)
-        self.auto_label.setToolTip("自动调整 Y 轴范围")
+        self.auto_label.setToolTip(
+            "Auto：自动适配 X/Y 轴范围（滚轮缩放或拖动会自动关闭，双击波形恢复）"
+        )
         self.auto_label.toggled.connect(self.toggle_auto_scale)
         info_l.addWidget(self.auto_label)
         self.info_bar.setLayout(info_l)
@@ -691,6 +699,9 @@ class MainWindow(QMainWindow):
 
         self.stat_bar.setLayout(stat_l)
         plot_l.addWidget(self.stat_bar)
+
+        # Auto 按钮就绪后再建波形页，保证页面的 Auto 状态与之同步
+        self._create_page()
 
         self.plot_card.setLayout(plot_l)
 
@@ -764,6 +775,7 @@ class MainWindow(QMainWindow):
         self.encoding_btn = QToolButton()
         self.encoding_btn.setObjectName("flatTool")
         self.encoding_btn.setText("⌁ UTF-8")
+        self.encoding_btn.setMinimumWidth(108)
         self.encoding_btn.setToolTip("发送文本使用的编码")
         self.encoding_btn.setPopupMode(QToolButton.InstantPopup)
         enc_menu = QMenu(self.encoding_btn)
@@ -853,7 +865,7 @@ class MainWindow(QMainWindow):
 
         self.right_collapse = QToolButton()
         self.right_collapse.setObjectName("panelBtn")
-        self.right_collapse.setIcon(icon("chevron_right", 18, "#4B6078"))
+        self.right_collapse.setIcon(icon("curve", 18, "#2D7EF1"))
         self.right_collapse.setIconSize(QSize(18, 18))
         self.right_collapse.setToolTip("收起数据栏")
         self.right_collapse.clicked.connect(lambda: self.set_data_panel_collapsed(True))
@@ -873,7 +885,7 @@ class MainWindow(QMainWindow):
             lay.addWidget(row)
 
         self.empty_hint = make_label(
-            "暂无变量\n连接设备或右键波形区添加变量", "emptyHint"
+            "暂无变量\n接收到数据后会自动显示变量", "emptyHint"
         )
         self.empty_hint.setAlignment(Qt.AlignCenter)
         self.empty_hint.setWordWrap(True)
@@ -884,16 +896,17 @@ class MainWindow(QMainWindow):
 
         self.right_strip = QFrame()
         self.right_strip.setObjectName("railRight")
-        self.right_strip.setFixedWidth(44)
-        strip_lay = vbox((0, 10, 0, 10), 8)
+        self.right_strip.setFixedWidth(48)
+        strip_lay = vbox((5, 8, 5, 8), 8)
         expand_btn = QToolButton()
         expand_btn.setObjectName("railBtn")
-        expand_btn.setIcon(icon("chevron_left", 20, "#2D7EF1"))
-        expand_btn.setIconSize(QSize(20, 20))
+        expand_btn.setIcon(icon("curve", 24, "#2D7EF1"))
+        expand_btn.setIconSize(QSize(24, 24))
+        expand_btn.setCheckable(True)
+        expand_btn.setChecked(True)
         expand_btn.setToolTip("展开数据栏")
         expand_btn.clicked.connect(lambda: self.set_data_panel_collapsed(False))
         strip_lay.addWidget(expand_btn, 0, Qt.AlignHCenter)
-        strip_lay.addWidget(make_label("数\n据", "sectionBlue", Qt.AlignHCenter))
         strip_lay.addStretch(1)
         self.right_strip.setLayout(strip_lay)
         self.right_strip.setVisible(False)
@@ -916,9 +929,9 @@ class MainWindow(QMainWindow):
                 self._right_width = sizes[1]
             self.right_body.setVisible(False)
             self.right_strip.setVisible(True)
-            self.right_panel.setMinimumWidth(44)
-            self.right_panel.setMaximumWidth(44)
-            splitter.setSizes([max(200, total - 44), 44])
+            self.right_panel.setMinimumWidth(48)
+            self.right_panel.setMaximumWidth(48)
+            splitter.setSizes([max(200, total - 48), 48])
         else:
             self.right_strip.setVisible(False)
             self.right_body.setVisible(True)
@@ -938,13 +951,18 @@ class MainWindow(QMainWindow):
         page = PlotPage()
         page.set_adjust_mode(self.mouse_adjust)
         page.set_channel_count(self.channel_count)
+        page.set_auto_scale(
+            self.auto_label.isChecked() if hasattr(self, "auto_label") else True
+        )
         page.gainChanged.connect(self._on_drag_gain)
         page.offsetChanged.connect(self._on_drag_offset)
+        page.autoScaleRequested.connect(self.auto_label.setChecked)
         page.contextMenuRequested.connect(
             lambda pos, target=page: self._show_plot_menu_at(target, pos)
         )
-        for i, color in enumerate(self.channel_colors):
-            page.set_channel_color(i, color)
+        for i in range(MAX_CHANNELS):
+            page.set_channel_color(i, self.channel_colors[i])
+            page.set_channel_name(i, self.channel_names[i])
         self.pages.append(page)
         self.plot_stack.addWidget(page)
         self.plot_stack.setCurrentWidget(page)
@@ -1027,6 +1045,7 @@ class MainWindow(QMainWindow):
         self.channel_decimals[index] = int(decimals)
         for page in self.pages:
             page.set_channel_color(index, color)
+            page.set_channel_name(index, name)
             page.set_visible(index, True)
         row = self.channel_rows[index]
         row.set_name(name)
@@ -1042,14 +1061,9 @@ class MainWindow(QMainWindow):
         self._build_variable_menu(index).exec(global_pos)
 
     def _build_variable_menu(self, index: int | None = None) -> QMenu:
-        target = self.selected_channel if index is None else index
         menu = QMenu(self)
-        menu.addAction("添加变量…", self.add_variable)
-
-        edit_act = menu.addAction("变量设置…", lambda: self.edit_variable(target))
-        edit_act.setEnabled(0 <= target < self.channel_count)
-
-        vis_menu = menu.addMenu("显示曲线")
+        vis_menu = QMenu("显示变量", menu)
+        menu.addMenu(vis_menu)
         for i in range(self.channel_count):
             act = vis_menu.addAction(self.channel_names[i])
             act.setCheckable(True)
@@ -1058,6 +1072,10 @@ class MainWindow(QMainWindow):
                 lambda on, idx=i: self.channel_rows[idx].eye.setChecked(on)
             )
         vis_menu.setEnabled(self.channel_count > 0)
+
+        target = self.selected_channel if index is None else index
+        edit_act = menu.addAction("变量设置…", lambda: self.edit_variable(target))
+        edit_act.setEnabled(0 <= target < self.channel_count)
 
         adjust_act = menu.addAction("鼠标调整模式")
         adjust_act.setCheckable(True)
@@ -1406,6 +1424,8 @@ class MainWindow(QMainWindow):
         """右上角按钮：只在「模拟模式 / 模拟中」之间切换，始终不显示串口。"""
         if self.interface_name != "模拟模式":
             self.iface_combo.setCurrentText("模拟模式")
+            if not self.demo_enabled:
+                self._toggle_demo_stream()
             return
         self._toggle_demo_stream()
 
@@ -1431,7 +1451,8 @@ class MainWindow(QMainWindow):
             ("停止位", "serial_stopbits", [1, 2]),
             ("流控", "serial_flow", ["None", "Hardware", "Software"]),
         ):
-            sub = menu.addMenu(title)
+            sub = QMenu(title, menu)
+            menu.addMenu(sub)
             current = getattr(self, attr)
             for option in options:
                 act = sub.addAction(str(option))
@@ -1501,7 +1522,7 @@ class MainWindow(QMainWindow):
         self.demo_enabled = not self.demo_enabled
         self._set_link_state(self.demo_enabled)
         if self.demo_enabled:
-            self.mode_tag.setText("● 模拟模式")
+            self.mode_tag.setText("● 模拟中")
             self.mode_tag.setObjectName("green")
             self.statusBar().showMessage("模拟模式运行中，可发送命令", 3000)
         else:
@@ -1752,7 +1773,7 @@ class MainWindow(QMainWindow):
 
     def toggle_auto_scale(self, checked: bool) -> None:
         for page in self.pages:
-            page.auto_scale = checked
+            page.set_auto_scale(checked)
             page.refresh()
 
     def on_channel_toggled(self, index: int, visible: bool) -> None:
@@ -1852,8 +1873,9 @@ class MainWindow(QMainWindow):
         for page in self.pages:
             page.set_channel_count(0)
             page.clear_data()
-            for i, color in enumerate(self.channel_colors):
-                page.set_channel_color(i, color)
+            for i in range(MAX_CHANNELS):
+                page.set_channel_color(i, self.channel_colors[i])
+                page.set_channel_name(i, self.channel_names[i])
         if hasattr(self, "channel_rows"):
             for i, row in enumerate(self.channel_rows):
                 row.setVisible(False)
@@ -1880,9 +1902,15 @@ class MainWindow(QMainWindow):
         return groups
 
     def _group_color(self, name: str) -> str:
+        """组配色：优先用手动选择的颜色，否则按调色板自动分配一个没用过的。"""
         if name not in self._group_colors:
-            index = len(self._group_colors) % len(GROUP_COLORS)
-            self._group_colors[name] = GROUP_COLORS[index]
+            used = set(self._group_colors.values())
+            color = GROUP_COLORS[len(self._group_colors) % len(GROUP_COLORS)]
+            for candidate in GROUP_COLORS:
+                if candidate not in used:
+                    color = candidate
+                    break
+            self._group_colors[name] = color
         return self._group_colors[name]
 
     def _apply_group_styles(self) -> None:
@@ -1941,6 +1969,8 @@ class MainWindow(QMainWindow):
         item.send_requested.connect(self._on_command_send)
         item.remove_requested.connect(self._remove_command)
         item.edit_requested.connect(self._edit_command)
+        item.groupRenameRequested.connect(self._rename_command_group)
+        item.groupColorRequested.connect(self._set_command_group_color)
         self.cmd_layout.insertWidget(self.cmd_layout.indexOf(self.cmd_empty), item)
         self._update_command_hint()
         self._apply_group_styles()
@@ -1998,11 +2028,49 @@ class MainWindow(QMainWindow):
         self._apply_group_styles()
         self._refresh_command_previews()
 
+    def _rename_command_group(self, item: CommandItem, name: str) -> None:
+        """双击组徽标改名：同组所有滑块一起换成新组名。"""
+        old = item.group
+        name = name.strip()
+        if not name or name == old:
+            return
+        for member in self._group_members(item):
+            member.group = name
+            member.refresh()
+        self._apply_group_styles()
+        self._refresh_command_previews()
+        self.statusBar().showMessage(f"滑块组 {old} 已重命名为 {name}", 2500)
+
+    def _set_command_group_color(self, item: CommandItem, color: str) -> None:
+        """右键组徽标换色：整组滑块统一换色，空字符串表示恢复自动配色。"""
+        name = item.group
+        if not name:
+            return
+        if color:
+            self._group_colors[name] = color
+        else:
+            self._group_colors.pop(name, None)
+        self._apply_group_styles()
+        self.statusBar().showMessage(
+            f"滑块组 {name} " + ("已恢复自动配色" if not color else "配色已更新"), 2000
+        )
+
     def _remove_command(self, item: CommandItem) -> None:
-        item.setParent(None)
-        item.deleteLater()
+        """删除命令；属于滑块组时整组一起删除。"""
+        targets = (
+            self._group_members(item)
+            if item.kind == "slider" and item.group
+            else [item]
+        )
+        for member in targets:
+            member.setParent(None)
+            member.deleteLater()
         self._update_command_hint()
         QTimer.singleShot(0, self._after_command_change)
+        if len(targets) > 1:
+            self.statusBar().showMessage(
+                f"已删除滑块组 {item.group}（{len(targets)} 个滑块）", 2500
+            )
 
     def _after_command_change(self) -> None:
         self._apply_group_styles()

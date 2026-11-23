@@ -47,6 +47,17 @@ CHANNEL_COLORS = [
     "#7A7CF5",
 ]
 
+# 滑块组配色：自动分配，也用于右键一键换色
+GROUP_COLORS = [
+    "#2D7EF1",
+    "#17B283",
+    "#9B6DFF",
+    "#FF9C3D",
+    "#00B9C7",
+    "#EF5350",
+]
+GROUP_COLOR_LABELS = ["蓝", "绿", "紫", "橙", "青", "红"]
+
 APP_STYLE = """
 QMainWindow, QWidget#root {
     background: #f5f7fb;
@@ -142,12 +153,20 @@ QPushButton#flatTool, QToolButton#flatTool {
     background: transparent;
     border: 0px;
     color: #4b6078;
-    padding: 5px 8px;
+    padding: 6px 10px;
+    min-height: 26px;
     font-size: 14px;
 }
 QPushButton#flatTool:hover, QToolButton#flatTool:hover {
     background: #edf4ff;
     border-radius: 7px;
+}
+QToolButton#flatTool::menu-indicator {
+    subcontrol-origin: padding;
+    subcontrol-position: center right;
+    right: 6px;
+    width: 8px;
+    height: 8px;
 }
 QPushButton#flatTool:checked, QToolButton#flatTool:checked {
     background: #e8f1ff;

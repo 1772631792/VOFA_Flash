@@ -10,12 +10,13 @@
 
 from __future__ import annotations
 
+import math
 import re
 import struct
 import time
 
-from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtCore import QEvent, QPoint, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QCheckBox,
@@ -36,6 +37,7 @@ from PySide6.QtWidgets import (
 )
 
 from .icons import icon
+from .theme import GROUP_COLOR_LABELS, GROUP_COLORS
 
 # 数据类型 -> (struct 字符, 字节数)
 _FMT: dict[str, tuple[str, int]] = {
@@ -85,6 +87,18 @@ def pack_number(value: float, dtype: str = "float32", big_endian: bool = False) 
     integer = int(round(float(value)))
     integer = max(int(lo), min(int(hi), integer))
     return struct.pack(endian + fmt, integer)
+
+
+def nice_ceil(value: float) -> float:
+    """把边界向上取整到 1 / 2 / 2.5 / 3 / 5 × 10^n，滑块两端的读数更整齐。"""
+    value = abs(float(value))
+    if value <= 0:
+        return 1.0
+    base = 10.0 ** math.floor(math.log10(value))
+    for factor in (1.0, 2.0, 2.5, 3.0, 5.0):
+        if value <= factor * base * (1.0 + 1e-9):
+            return factor * base
+    return 10.0 * base
 
 
 def _label(text: str, name: str | None = None) -> QLabel:
@@ -213,12 +227,66 @@ class AdaptiveSlider(QSlider):
             self._extend(False)
 
 
+class _TitleLabel(QLabel):
+    """可双击 / 可右键的标题标签。"""
+
+    doubleClicked = Signal()
+    rightClicked = Signal(object)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        self.doubleClicked.emit()
+        event.accept()
+
+    def contextMenuEvent(self, event) -> None:
+        self.rightClicked.emit(event.globalPos())
+        event.accept()
+
+
+class _RenameEdit(QLineEdit):
+    """就地改名输入框：回车 / 失焦提交，Esc 取消。"""
+
+    cancelled = Signal()
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key_Escape:
+            self.cancelled.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
+class _SelectAllSpin(QDoubleSpinBox):
+    """双击即全选整段文字的数值框。
+
+    QDoubleSpinBox 默认只选中被双击到的那一小段（例如小数点后的位数），
+    这里直接吞掉编辑框的双击事件再 selectAll()，保证整段数字一次性选中。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        editor = self.lineEdit()
+        if editor is not None:
+            editor.installEventFilter(self)
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        if obj is self.lineEdit() and event.type() == QEvent.Type.MouseButtonDblClick:
+            obj.selectAll()
+            return True
+        return super().eventFilter(obj, event)
+
+
+class ValueSpin(_SelectAllSpin):
+    """滑动条数值框：双击全选，输入后量程自动适配。"""
+
+
 class CommandItem(QFrame):
     """命令抽屉中的一条命令（固定命令或滑动条）。"""
 
     send_requested = Signal(object)
     remove_requested = Signal(object)
     edit_requested = Signal(object)
+    groupRenameRequested = Signal(object, str)
+    groupColorRequested = Signal(object, str)
 
     def __init__(
         self,
@@ -254,6 +322,13 @@ class CommandItem(QFrame):
         self.badge: QLabel | None = None
         self._group_color: str | None = None
         self._syncing = False
+        self._spin_dirty = False
+        self._renaming = False
+        self._rename_target = "title"
+        self._rename_edit: _RenameEdit | None = None
+        self._rename_widget: QWidget | None = None
+        self.top_row: QHBoxLayout | None = None
+        self.title_label: QLabel | None = None
         self._send_timer = QTimer(self)
         self._send_timer.setSingleShot(True)
         self._send_timer.setInterval(40)
@@ -344,23 +419,36 @@ class CommandItem(QFrame):
                         child.setParent(None)
                         child.deleteLater()
                 layout.deleteLater()
+        self._renaming = False
+        if self._rename_edit is not None:
+            self._rename_edit.hide()
         self.slider = None
         self.value_spin = None
         self.edit = None
         self.badge = None
+        self.title_label = None
+        self.top_row = None
+        self._rename_widget = None
 
     def _rebuild(self) -> None:
         self._clear()
 
-        title_label = _label(self.title, "sectionBlue")
-        title_label.setToolTip("双击可编辑设置")
+        title_label = _TitleLabel(self.title)
+        title_label.setObjectName("sectionBlue")
+        title_label.setToolTip("双击修改名称")
+        title_label.doubleClicked.connect(self._begin_rename)
+        self.title_label = title_label
         top = QHBoxLayout()
         top.setSpacing(4)
+        self.top_row = top
         top.addWidget(title_label)
         top.addStretch(1)
         if self.kind == "slider" and self.group:
-            self.badge = _label(f"● {self.group}", "tinyMuted")
-            self.badge.setToolTip(f"绑定组：{self.group}")
+            self.badge = _TitleLabel(f"● {self.group}")
+            self.badge.setObjectName("tinyMuted")
+            self.badge.setToolTip("双击改组名 · 右键一键换整组配色")
+            self.badge.doubleClicked.connect(self._begin_group_rename)
+            self.badge.rightClicked.connect(self._show_group_color_menu)
             top.addWidget(self.badge)
             top.addSpacing(4)
 
@@ -371,10 +459,17 @@ class CommandItem(QFrame):
         top.addWidget(send_btn)
 
         close_btn = QToolButton()
-        close_btn.setObjectName("flatTool")
+        close_btn.setObjectName("cmdClose")
+        # 不要沿用 #flatTool 的 10px 内边距，否则 24px 按钮里图标会被压成一个点
+        close_btn.setStyleSheet(
+            "QToolButton#cmdClose{background:transparent;border:0px;"
+            "border-radius:6px;padding:0px;}"
+            "QToolButton#cmdClose:hover{background:rgba(199,75,92,0.12);}"
+        )
         close_btn.setIcon(icon("close", 18, "#8A97A8"))
+        close_btn.setIconSize(QSize(16, 16))
         close_btn.setFixedSize(24, 24)
-        close_btn.setToolTip("删除该命令")
+        close_btn.setToolTip("删除整个滑块组" if self.group else "删除该命令")
         close_btn.clicked.connect(lambda: self.remove_requested.emit(self))
         top.addWidget(close_btn)
         self.main.addLayout(top)
@@ -398,15 +493,19 @@ class CommandItem(QFrame):
             self.slider.floatRangeChanged.connect(self._on_range_changed)
             row.addWidget(self.slider, 1)
 
-            self.value_spin = QDoubleSpinBox()
+            self.value_spin = ValueSpin()
             self.value_spin.setDecimals(self.decimals)
-            self.value_spin.setRange(self.vmin, self.vmax)
+            limit_lo, limit_hi = dtype_limits(self.dtype)
+            self.value_spin.setRange(limit_lo, limit_hi)
             self.value_spin.setSingleStep(self.step)
-            self.value_spin.setValue(min(max(self.value, self.vmin), self.vmax))
+            self.value_spin.setValue(self.value)
             self.value_spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
             self.value_spin.setFixedHeight(28)
             self.value_spin.setFixedWidth(90)
+            self.value_spin.setToolTip("双击全选，输入后量程会自动适配")
             self.value_spin.valueChanged.connect(self._on_spin_value)
+            self.value_spin.editingFinished.connect(self._on_value_committed)
+            self.value_spin.lineEdit().textEdited.connect(self._mark_spin_dirty)
             row.addWidget(self.value_spin)
             self.main.addLayout(row)
 
@@ -472,10 +571,53 @@ class CommandItem(QFrame):
 
     def _on_range_changed(self, lo: float, hi: float) -> None:
         self.vmin, self.vmax = lo, hi
-        if self.value_spin is not None:
+        self._schedule_send()
+
+    def _mark_spin_dirty(self, _text: str) -> None:
+        self._spin_dirty = True
+
+    def _auto_fit_range(self, value: float) -> tuple[float, float]:
+        """按输入值推算合适的量程：数值大就放大，数值小就收紧。
+
+        保持原有量程的正负习惯（对称 / 仅正 / 仅负），边界取整到好看的数字，
+        并限制在数据类型能表示的范围内。
+        """
+        lo, hi = self.slider.floatRange()
+        quantum = 10.0 ** (-self.decimals) * 10.0
+        need = max(abs(value) * 1.5, abs(self.step) * 4.0, quantum, 1e-6)
+        limit = nice_ceil(need)
+        if lo < 0 < hi:
+            new_lo, new_hi = -limit, limit
+        elif hi <= 0:
+            new_lo, new_hi = -limit, 0.0
+        else:
+            new_lo, new_hi = 0.0, limit
+        dtype_lo, dtype_hi = dtype_limits(self.dtype)
+        new_lo = max(new_lo, dtype_lo)
+        new_hi = min(new_hi, dtype_hi)
+        if new_hi <= new_lo:
+            new_lo, new_hi = dtype_lo, dtype_hi
+        digits = max(self.decimals, 0)
+        return round(new_lo, digits), round(new_hi, digits)
+
+    def _on_value_committed(self) -> None:
+        """手动输入数值后自动适配滑块量程，不必再打开设置改范围。"""
+        if not self._spin_dirty or self.slider is None:
+            return
+        self._spin_dirty = False
+        value = float(self.value_spin.value())
+        self.value = value
+        lo, hi = self.slider.floatRange()
+        new_lo, new_hi = self._auto_fit_range(value)
+        span = hi - lo
+        new_span = new_hi - new_lo
+        # 超出量程就放大；量程远超数值所需才收紧，小幅差异保持不动
+        needs_fit = value < lo or value > hi or span > new_span * 6.0
+        if needs_fit and (new_lo != lo or new_hi != hi):
+            self.vmin, self.vmax = new_lo, new_hi
             self._syncing = True
-            self.value_spin.setRange(lo, hi)
-            self.value_spin.setValue(self.value)
+            self.slider.setFloatRange(new_lo, new_hi)
+            self.slider.setFloatValue(value)
             self._syncing = False
         self._schedule_send()
 
@@ -485,6 +627,102 @@ class CommandItem(QFrame):
 
     def set_auto_send(self, on: bool) -> None:
         self.auto_send = on
+
+    # ---- 就地改名 ----
+    def _begin_rename(self) -> None:
+        self._begin_inline_edit("title")
+
+    def _begin_group_rename(self) -> None:
+        self._begin_inline_edit("group")
+
+    def _begin_inline_edit(self, target: str) -> None:
+        if self._renaming or self.top_row is None:
+            return
+        widget = self.badge if target == "group" else self.title_label
+        if widget is None:
+            return
+        self._rename_target = target
+        self._rename_widget = widget
+        self._renaming = True
+        if self._rename_edit is None:
+            self._rename_edit = _RenameEdit(self)
+            self._rename_edit.setFixedHeight(24)
+            self._rename_edit.cancelled.connect(self._cancel_rename)
+            self._rename_edit.editingFinished.connect(self._finish_rename)
+        index = max(0, self.top_row.indexOf(widget))
+        self.top_row.insertWidget(index, self._rename_edit)
+        self._rename_edit.setText(self.group if target == "group" else self.title)
+        self._rename_edit.setFixedWidth(110 if target == "title" else 90)
+        widget.hide()
+        self._rename_edit.show()
+        self._rename_edit.setFocus()
+        self._rename_edit.selectAll()
+
+    def _finish_rename(self) -> None:
+        if not self._renaming or self._rename_edit is None:
+            return
+        self._renaming = False
+        text = self._rename_edit.text().strip()
+        target = self._rename_target
+        self._end_inline_edit()
+        if target == "group":
+            if text and text != self.group:
+                self.groupRenameRequested.emit(self, text)
+            return
+        if text:
+            self.title = text
+            if self.title_label is not None:
+                self.title_label.setText(text)
+
+    def _cancel_rename(self) -> None:
+        if not self._renaming:
+            return
+        self._renaming = False
+        self._end_inline_edit()
+
+    def _end_inline_edit(self) -> None:
+        edit = self._rename_edit
+        if edit is not None:
+            edit.hide()
+            if self.top_row is not None:
+                self.top_row.removeWidget(edit)
+        widget = getattr(self, "_rename_widget", None)
+        if widget is not None:
+            widget.show()
+        self._rename_widget = None
+
+    # ---- 组配色 ----
+    def group_color_menu(self) -> QMenu:
+        """整组配色调色板：自动配色 + 6 个预设色，点一下即生效。"""
+        menu = QMenu(self)
+        menu.addAction("自动配色", lambda: self.groupColorRequested.emit(self, ""))
+        menu.addSeparator()
+        current = (self._group_color or "").upper()
+        for label, color in zip(GROUP_COLOR_LABELS, GROUP_COLORS):
+            act = menu.addAction(self._color_icon(color), label)
+            act.setCheckable(True)
+            act.setChecked(current == color.upper())
+            act.triggered.connect(
+                lambda _=False, value=color: self.groupColorRequested.emit(self, value)
+            )
+        return menu
+
+    def _show_group_color_menu(self, global_pos: QPoint) -> None:
+        if self.kind != "slider" or not self.group:
+            return
+        self.group_color_menu().exec(global_pos)
+
+    @staticmethod
+    def _color_icon(color: str) -> QIcon:
+        pix = QPixmap(12, 12)
+        pix.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pix)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(color))
+        painter.drawRoundedRect(0, 0, 12, 12, 3, 3)
+        painter.end()
+        return QIcon(pix)
 
     # ---- 交互 ----
     def contextMenuEvent(self, event) -> None:
@@ -685,8 +923,8 @@ class CommandDialog(QDialog):
         return row
 
     @staticmethod
-    def _dspin(value: float) -> QDoubleSpinBox:
-        spin = QDoubleSpinBox()
+    def _dspin(value: float) -> _SelectAllSpin:
+        spin = _SelectAllSpin()
         spin.setDecimals(3)
         spin.setRange(-1e9, 1e9)
         spin.setSingleStep(1.0)
