@@ -1,4 +1,6 @@
-"""VOFA+ 风格的颜色、尺寸、字体与全局样式表。"""
+"""VOFA+ 风格的颜色、尺寸、字体与全局样式表（浅色 / 深色两套）。"""
+
+import re
 
 from PySide6.QtGui import QColor, QFont
 
@@ -148,6 +150,11 @@ QPushButton#green:hover {
 QPushButton#danger {
     color: #c74b5c;
     font-weight: 700;
+    background: #ffffff;
+    border: 1px solid #f0d2d8;
+}
+QPushButton#danger:hover {
+    background: #fdf3f5;
 }
 QPushButton#flatTool, QToolButton#flatTool {
     background: transparent;
@@ -253,6 +260,14 @@ QComboBox::drop-down {
     border: 0px;
     width: 20px;
 }
+QComboBox:hover, QSpinBox:hover, QDoubleSpinBox:hover, QLineEdit:hover {
+    border-color: #9fc3ff;
+}
+QComboBox QLineEdit {
+    background: transparent;
+    border: 0px;
+    padding: 0px 2px;
+}
 QComboBox QAbstractItemView {
     background: #ffffff;
     border: 1px solid #d8e1ec;
@@ -298,7 +313,7 @@ QMenu::item:disabled {
 }
 QMenu::separator {
     height: 1px;
-    background: #eef2f7;
+    background: #eceff4;
     margin: 5px 8px;
 }
 QMenu::indicator {
@@ -358,7 +373,7 @@ QSlider::handle:horizontal {
     margin: -5px 0px;
     border-radius: 7px;
     border: 2px solid #2d7ef1;
-    background: #ffffff;
+    background: #fdfdfd;
 }
 QSlider::handle:horizontal:hover {
     background: #eef5ff;
@@ -388,14 +403,157 @@ QTabBar::tab {
     padding: 7px 16px;
     margin-right: 2px;
 }
+QTabBar::tab:hover {
+    background: #eef5ff;
+    color: #1f67c7;
+}
 QTabBar::tab:selected {
     background: #ffffff;
     color: #1f67c7;
     font-weight: 700;
+}
+QCheckBox:hover {
+    color: #1f67c7;
 }
 QStatusBar {
     background: #ffffff;
     color: #7b8798;
     border-top: 1px solid #e6ebf2;
 }
+QFrame#vline, QFrame#hr {
+    background: #e6ebf2;
+    border: 0px;
+}
+QLabel#versionPill {
+    color: #1f67c7;
+    background: rgba(45, 126, 241, 0.10);
+    border-radius: 9px;
+    padding: 1px 8px;
+    font-size: 11px;
+    font-weight: 800;
+}
+QToolButton#iconBtn {
+    min-width: 26px;
+    min-height: 26px;
+    max-width: 26px;
+    max-height: 26px;
+    border-radius: 8px;
+    background: transparent;
+    border: 1px solid transparent;
+    padding: 0px;
+}
+QToolButton#iconBtn:hover {
+    background: #eef5ff;
+    border-color: #d6e1ef;
+}
+QToolButton#iconBtn:checked {
+    background: #e8f1ff;
+    border-color: #cfe0f8;
+}
+QPushButton#autoBtn {
+    font-size: 17px;
+    font-style: italic;
+    font-weight: 800;
+    color: #9aa8b8;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 7px;
+    padding: 2px 12px;
+}
+QPushButton#autoBtn:hover {
+    color: #1f67c7;
+    background: #eef5ff;
+}
+QPushButton#autoBtn:checked {
+    color: #1f67c7;
+    background: #e8f1ff;
+    border-color: #cfe0f8;
+}
+QToolButton#themeCard {
+    background: #ffffff;
+    border: 1px solid #e6ebf2;
+    border-radius: 12px;
+    padding: 10px 6px 8px 6px;
+    color: #4b6078;
+    font-size: 12px;
+    font-weight: 700;
+}
+QToolButton#themeCard:hover {
+    border-color: #9fc3ff;
+    background: #f7fbff;
+}
+QToolButton#themeCard:checked {
+    border: 2px solid #2d7ef1;
+    background: #eef5ff;
+    color: #1f67c7;
+}
 """
+
+# 深色主题：参考 VS Code Dark+ 的中性灰底 + 蓝色强调
+# 仍采用「对浅色样式表做颜色映射」的做法，保证两套主题选择器完全一致
+_DARK_MAP = {
+    # 画布 / 面板
+    "#f5f7fb": "#1e1e1e",  # 窗口底
+    "#ffffff": "#252526",  # 卡片 / 输入框 / 菜单
+    "#f7f9fc": "#2d2d2d",
+    "#eef2f7": "#252526",  # 侧栏
+    "#eef2f8": "#252526",  # 标签栏
+    # 描边
+    "#e6ebf2": "#3c3c3c",
+    "#e9eef6": "#3c3c3c",
+    "#e1e8f2": "#3c3c3c",
+    "#e2e8f0": "#3c3c3c",
+    "#e8edf4": "#3c3c3c",
+    "#e8eef7": "#3c3c3c",
+    "#eceff4": "#3c3c3c",
+    "#f0d2d8": "#5a1d1d",
+    "#dde5ef": "#3c3c3c",
+    "#d8e1ec": "#3c3c3c",
+    "#d6e1ef": "#454545",
+    "#c3cedd": "#6b6b6b",
+    "#fdfdfd": "#d4d4d4",  # 滑块手柄
+    # 交互底色
+    "#eef5ff": "#2a2d2e",
+    "#edf4ff": "#2a2d2e",
+    "#f7fbff": "#2a2d2e",
+    "#dfeeff": "#0a4d78",
+    "#e8f1ff": "#094771",
+    "#cfe0f8": "#007acc",
+    "#9fc3ff": "#007acc",
+    "#69a2f2": "#007acc",
+    "#c6dcff": "#264f78",
+    "#fdf3f5": "#2a1a1d",
+    # 文字
+    "#24374a": "#d4d4d4",
+    "#23364b": "#d4d4d4",
+    "#364a61": "#cccccc",
+    "#40556f": "#cccccc",
+    "#4b6078": "#cccccc",
+    "#7b8798": "#9d9d9d",
+    "#90a0b3": "#8b8b8b",
+    "#9aa8b8": "#858585",
+    "#aab6c6": "#7a7a7a",
+    "#b6c0cc": "#656565",
+    # 强调色
+    "#2d7ef1": "#0e639c",
+    "#1f6fe0": "#1177bb",
+    "#1f67c7": "#3794ff",
+    "#2672db": "#4daafc",
+    "#c74b5c": "#f48771",
+}
+
+
+def _build_dark_style() -> str:
+    return re.sub(
+        r"#[0-9a-fA-F]{6}",
+        lambda m: _DARK_MAP.get(m.group(0).lower(), m.group(0)),
+        APP_STYLE,
+    )
+
+
+DARK_STYLE = _build_dark_style()
+
+
+def app_style(dark: bool = False) -> str:
+    """返回全局样式表：dark=True 为深色主题。"""
+    return DARK_STYLE if dark else APP_STYLE

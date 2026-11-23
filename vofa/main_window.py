@@ -6,11 +6,12 @@ import csv
 import math
 import re
 import struct
+import sys
 import time
 
 import serial.tools.list_ports
-from PySide6.QtCore import QPoint, QSize, Qt, QTimer, Signal, Slot
-from PySide6.QtGui import QFont
+from PySide6.QtCore import QEvent, QPoint, QSettings, QSize, Qt, QTimer, Signal, Slot
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
@@ -43,7 +44,7 @@ from .icons import app_icon, icon
 from .plot_widget import MAX_CHANNELS, PlotPage
 from .protocol import JustFloatParser
 from .serial_worker import SerialWorker
-from .theme import APP_STYLE, CHANNEL_COLORS, GROUP_COLORS
+from .theme import CHANNEL_COLORS, GROUP_COLORS, app_style
 from .transport import (
     BaseTransport,
     TcpClientTransport,
@@ -53,6 +54,46 @@ from .transport import (
 
 ENGINES = ["JustFloat", "RawData"]
 INTERFACES = ["模拟模式", "串口", "UDP", "TCP客户端", "TCP服务端"]
+
+SETTINGS_ORG = "VOFAFlash"
+SETTINGS_APP = "VOFAFlash"
+ICON_NEUTRAL = "#7C8CA0"
+DEMO_CHANNELS = 3  # 模拟模式的通道数：JustFloat 本身不限通道，不占用顶栏
+
+
+def load_dark_setting() -> bool:
+    """读取上次选择的外观；没有记录时默认浅色。"""
+    return bool(QSettings(SETTINGS_ORG, SETTINGS_APP).value("appearance/dark", False, type=bool))
+
+
+def save_dark_setting(dark: bool) -> None:
+    QSettings(SETTINGS_ORG, SETTINGS_APP).setValue("appearance/dark", bool(dark))
+
+
+def apply_dark_titlebar(window: QWidget, dark: bool) -> bool:
+    """Windows 10/11：把系统标题栏切成深色 / 浅色，其它平台直接忽略。"""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        hwnd = wintypes.HWND(int(window.winId()))
+        value = ctypes.c_int(1 if dark else 0)
+        for attribute in (20, 19):  # 20: Win10 1903+，19: 更早的版本
+            if ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, attribute, ctypes.byref(value), ctypes.sizeof(value)
+            ) == 0:
+                break
+        else:
+            return False
+        # 立刻重画一次非客户区，否则要拖动窗口才会变色
+        ctypes.windll.user32.SetWindowPos(
+            hwnd, 0, 0, 0, 0, 0, 0x0027  # FRAMECHANGED | NOMOVE | NOSIZE | NOZORDER
+        )
+        return True
+    except Exception:
+        return False
 
 
 def vbox(margins=(0, 0, 0, 0), spacing=8):
@@ -80,8 +121,15 @@ def make_label(text: str, name: str | None = None, align=None) -> QLabel:
 
 def make_hr() -> QFrame:
     w = QFrame()
+    w.setObjectName("hr")
     w.setFixedHeight(1)
-    w.setStyleSheet("background:#e8edf4;border:0px;")
+    return w
+
+
+def make_vline(height: int = 22) -> QFrame:
+    w = QFrame()
+    w.setObjectName("vline")
+    w.setFixedSize(1, height)
     return w
 
 
@@ -99,9 +147,14 @@ class ChannelRow(QWidget):
         self.color = color
         self._selected = False
 
+        self.setObjectName("channelRow")
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self.setCursor(Qt.PointingHandCursor)
+
         self.eye = QCheckBox()
         self.eye.setChecked(True)
         self.eye.setFixedWidth(22)
+        self.eye.setCursor(Qt.PointingHandCursor)
         self.eye.toggled.connect(lambda on: self.toggled.emit(self.index, on))
 
         self.name = QLabel(f"I{index}")
@@ -112,6 +165,9 @@ class ChannelRow(QWidget):
         self.value.setStyleSheet(
             f"font-family:Consolas;font-weight:700;color:{color};"
         )
+        # 文字不拦截鼠标，整行才能统一响应 hover / 点击
+        for lab in (self.name, self.value):
+            lab.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
 
         lay = hbox((8, 3, 8, 3), 8)
         lay.addWidget(self.eye)
@@ -122,10 +178,20 @@ class ChannelRow(QWidget):
         self._apply_style()
 
     def _apply_style(self) -> None:
-        bg = "#F1F6FF" if self._selected else "transparent"
-        border = "1px solid #CFE0F8" if self._selected else "1px solid transparent"
+        # 用半透明强调色，深浅主题下都能看清，不需要额外切换
+        if self._selected:
+            bg = "rgba(45,126,241,32)"
+            border = "1px solid rgba(45,126,241,120)"
+            hover = "rgba(45,126,241,52)"
+        else:
+            bg = "transparent"
+            border = "1px solid transparent"
+            hover = "rgba(120,140,165,28)"
         self.setStyleSheet(
-            f"QWidget{{background:{bg};border:{border};border-radius:7px;}}"
+            "QWidget#channelRow{"
+            f"background:{bg};border:{border};border-radius:7px;}}"
+            f"QWidget#channelRow:hover{{background:{hover};"
+            f"border:1px solid rgba(45,126,241,90);}}"
         )
 
     def set_value(self, text: str) -> None:
@@ -265,15 +331,151 @@ class VariableDialog(QDialog):
         )
 
 
+class _ThemeCard(QToolButton):
+    """设置里的外观选项卡片：缩略图 + 名称，点一下即切换。"""
+
+    def __init__(self, title: str, window_bg: str, panel_bg: str, accent: str, parent=None):
+        super().__init__(parent)
+        self.setObjectName("themeCard")
+        self.setText(title)
+        self.setCheckable(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        self.setIconSize(QSize(112, 67))
+        self.setIcon(QIcon(self._preview(window_bg, panel_bg, accent)))
+        self.setMinimumHeight(104)
+
+    @staticmethod
+    def _preview(window_bg: str, panel_bg: str, accent: str) -> QPixmap:
+        pix = QPixmap(224, 134)
+        pix.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pix)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(window_bg))
+        painter.drawRoundedRect(0, 0, 224, 134, 14, 14)
+
+        painter.setBrush(QColor(panel_bg))
+        painter.setPen(QPen(QColor(120, 140, 165, 60), 1))
+        painter.drawRoundedRect(14, 14, 196, 106, 10, 10)
+
+        painter.setPen(QPen(QColor(120, 140, 165, 55), 1))
+        for i in range(1, 4):
+            y = 14 + 106 * i / 4
+            painter.drawLine(20, int(y), 204, int(y))
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(accent))
+        painter.drawRoundedRect(26, 24, 40, 6, 3, 3)
+
+        path = QPainterPath()
+        path.moveTo(24, 100)
+        path.cubicTo(60, 52, 92, 112, 122, 70)
+        path.cubicTo(146, 36, 172, 78, 200, 48)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QColor(accent), 2.6))
+        painter.drawPath(path)
+        painter.end()
+
+        pix.setDevicePixelRatio(2.0)
+        return pix
+
+
+class SettingsDialog(QDialog):
+    """设置：外观（浅色 / 深色立即生效）与语言（位置预留）。"""
+
+    themeChanged = Signal(bool)
+
+    def __init__(self, dark: bool, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("设置")
+        self.setMinimumWidth(470)
+
+        lay = vbox((22, 18, 22, 16), 12)
+        lay.addWidget(make_label("设置", "sectionBlue"))
+        lay.addWidget(make_label("外观与语言", "tinyMuted"))
+        lay.addWidget(make_hr())
+
+        lay.addWidget(make_label("外观", "sectionBlue"))
+        cards = hbox(spacing=14)
+        self.light_card = _ThemeCard("浅色", "#F1F4F9", "#FFFFFF", "#2D7EF1")
+        self.dark_card = _ThemeCard("深色", "#1E1E1E", "#252526", "#0E7ACC")
+        self.light_card.setChecked(not dark)
+        self.dark_card.setChecked(dark)
+        cards.addWidget(self.light_card, 1)
+        cards.addWidget(self.dark_card, 1)
+        lay.addLayout(cards)
+
+        lay.addWidget(make_label("语言", "sectionBlue"))
+        self.lang_combo = QComboBox()
+        self.lang_combo.addItem("简体中文")
+        self.lang_combo.addItem("English (coming soon)")
+        item = self.lang_combo.model().item(1)
+        if item is not None:
+            item.setEnabled(False)
+        lay.addWidget(self.lang_combo)
+        lay.addWidget(make_label("语言切换入口已预留，后续版本开放。", "tinyMuted"))
+
+        lay.addStretch(1)
+        buttons = hbox(spacing=8)
+        buttons.addStretch(1)
+        done_btn = QPushButton("完成")
+        done_btn.setObjectName("primary")
+        done_btn.setFixedWidth(88)
+        done_btn.clicked.connect(self.accept)
+        buttons.addWidget(done_btn)
+        lay.addLayout(buttons)
+        self.setLayout(lay)
+
+        self.light_card.clicked.connect(lambda: self._choose(False))
+        self.dark_card.clicked.connect(lambda: self._choose(True))
+
+    def _choose(self, dark: bool) -> None:
+        self.light_card.setChecked(not dark)
+        self.dark_card.setChecked(dark)
+        self.themeChanged.emit(dark)
+
+
+class _NumberCombo(QComboBox):
+    """可编辑的数值下拉：预设值可选，双击整段全选后可直接输入其它值。"""
+
+    def __init__(self, items, current: str = "", parent=None):
+        super().__init__(parent)
+        self.setEditable(True)
+        self.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.addItems([str(item) for item in items])
+        if current:
+            self.setCurrentText(str(current))
+        editor = self.lineEdit()
+        if editor is not None:
+            editor.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            editor.installEventFilter(self)
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        if obj is self.lineEdit() and event.type() == QEvent.Type.MouseButtonDblClick:
+            obj.selectAll()
+            return True
+        return super().eventFilter(obj, event)
+
+    def int_value(self, default: int = 500, low: int = 1, high: int = 2000) -> int:
+        try:
+            value = int(float(self.currentText().strip()))
+        except (TypeError, ValueError):
+            return default
+        return max(low, min(value, high))
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("VOFA+ Flash 1.0")
         self.setWindowIcon(app_icon())
         self.resize(1480, 900)
-        self.setMinimumSize(1180, 760)
+        self.setMinimumSize(1280, 760)
 
         # ---- 运行时状态 ----
+        self.dark = load_dark_setting()
         self.engine_name = "JustFloat"
         self.interface_name = "串口"
         self.worker: SerialWorker | BaseTransport | None = None
@@ -320,6 +522,7 @@ class MainWindow(QMainWindow):
         self._group_colors: dict[str, str] = {}
 
         self.build_ui()
+        self.apply_theme(self.dark, remember=False)
         self.refresh_ports()
         self.iface_combo.setCurrentIndex(INTERFACES.index("模拟模式"))
         self.on_iface_changed("模拟模式")
@@ -377,48 +580,72 @@ class MainWindow(QMainWindow):
             if btn.objectName() != "railBtn":
                 btn.setIconSize(QSize(18, 18))
 
+        # 所有可点控件统一用手型光标，鼠标移上去就能感知到"这里能点"
+        for widget in self.findChildren(QPushButton) + self.findChildren(QToolButton):
+            if widget.isEnabled():
+                widget.setCursor(Qt.PointingHandCursor)
+
+    @staticmethod
+    def _field(text: str, widget: QWidget) -> QHBoxLayout:
+        """顶栏字段：小号灰标签 + 控件，基线对齐。"""
+        row = hbox(spacing=6)
+        row.addWidget(make_label(text, "muted"))
+        row.addWidget(widget)
+        return row
+
     def build_topbar(self) -> QWidget:
         top = QFrame()
         top.setObjectName("topbar")
-        top.setFixedHeight(62)
+        top.setFixedHeight(64)
         lay = hbox((14, 0, 12, 0), 10)
 
-        lay.addWidget(make_label("VOFA+ Flash 1.0", "brand"))
-        lay.addWidget(make_label("|", "muted"))
+        # ---- 品牌 + 设置 ----
+        brand_row = hbox(spacing=8)
+        brand_row.addWidget(make_label("VOFA+ Flash", "brand"))
+        version = make_label("1.0", "versionPill")
+        version.setFixedHeight(20)
+        brand_row.addWidget(version, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.settings_btn = QToolButton()
+        self.settings_btn.setObjectName("iconBtn")
+        self.settings_btn.setIcon(icon("wrench", 18, ICON_NEUTRAL))
+        self.settings_btn.setIconSize(QSize(18, 18))
+        self.settings_btn.setCursor(Qt.PointingHandCursor)
+        self.settings_btn.setToolTip("设置：外观（浅色 / 深色）与语言")
+        self.settings_btn.clicked.connect(self.open_settings)
+        brand_row.addWidget(self.settings_btn)
+        lay.addLayout(brand_row)
 
-        lay.addWidget(make_label("数据引擎", "muted"))
+        lay.addWidget(make_vline())
+
+        # ---- 数据引擎 / 接口 ----
         self.engine_combo = QComboBox()
         self.engine_combo.addItems(ENGINES)
-        self.engine_combo.setFixedWidth(122)
+        self.engine_combo.setFixedWidth(108)
         self.engine_combo.currentTextChanged.connect(self.on_engine_changed)
-        lay.addWidget(self.engine_combo)
+        lay.addLayout(self._field("引擎", self.engine_combo))
 
-        lay.addWidget(make_label("接口", "muted"))
         self.iface_combo = QComboBox()
         self.iface_combo.addItems(INTERFACES)
-        self.iface_combo.setFixedWidth(112)
+        self.iface_combo.setFixedWidth(102)
         self.iface_combo.currentTextChanged.connect(self.on_iface_changed)
-        lay.addWidget(self.iface_combo)
+        lay.addLayout(self._field("接口", self.iface_combo))
 
-        # 串口参数
+        lay.addWidget(make_vline())
+
+        # ---- 串口参数 ----
         serial_page = QWidget()
-        sp = hbox(spacing=8)
+        sp = hbox(spacing=12)
         self.port_combo = QComboBox()
-        self.port_combo.setFixedWidth(128)
-        sp.addWidget(self.port_combo)
-        self.refresh_btn = QPushButton("刷新")
-        self.refresh_btn.setFixedWidth(64)
-        self.refresh_btn.setToolTip("刷新串口列表（也会每 3 秒自动检测）")
-        self.refresh_btn.clicked.connect(lambda: self.refresh_ports())
-        sp.addWidget(self.refresh_btn)
-        self.baud_combo = QComboBox()
-        self.baud_combo.setEditable(True)
-        self.baud_combo.addItems(
-            ["9600", "19200", "38400", "57600", "115200", "230400", "460800", "921600"]
+        self.port_combo.setFixedWidth(96)
+        self.port_combo.setToolTip("串口列表每 3 秒自动刷新，插拔设备无需手动操作")
+        sp.addLayout(self._field("端口", self.port_combo))
+        self.baud_combo = _NumberCombo(
+            ["9600", "19200", "38400", "57600", "115200", "230400", "460800", "921600"],
+            "115200",
         )
-        self.baud_combo.setCurrentText("115200")
-        self.baud_combo.setFixedWidth(108)
-        sp.addWidget(self.baud_combo)
+        self.baud_combo.setFixedWidth(88)
+        self.baud_combo.setToolTip("波特率：可从下拉选择，也可双击直接输入")
+        sp.addLayout(self._field("波特率", self.baud_combo))
 
         self.serial_fmt_btn = QToolButton()
         self.serial_fmt_btn.setObjectName("flatTool")
@@ -432,38 +659,33 @@ class MainWindow(QMainWindow):
 
         serial_page.setLayout(sp)
 
-        # 网络参数
+        # ---- 网络参数 ----
         net_page = QWidget()
-        np_lay = hbox(spacing=8)
+        np_lay = hbox(spacing=12)
         self.net_host_edit = QLineEdit("127.0.0.1")
         self.net_host_edit.setPlaceholderText("0.0.0.0")
-        self.net_host_edit.setFixedWidth(140)
-        np_lay.addWidget(self.net_host_edit)
+        self.net_host_edit.setFixedWidth(124)
+        np_lay.addLayout(self._field("地址", self.net_host_edit))
         self.net_port_spin = QSpinBox()
         self.net_port_spin.setRange(1, 65535)
         self.net_port_spin.setValue(8886)
-        self.net_port_spin.setFixedWidth(96)
-        np_lay.addWidget(self.net_port_spin)
+        self.net_port_spin.setFixedWidth(84)
+        self.net_port_spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        np_lay.addLayout(self._field("端口", self.net_port_spin))
         net_page.setLayout(np_lay)
 
-        # 模拟数据
+        # ---- 模拟数据：采样率（预设可选，也可双击手输，单位 Hz 放在框外） ----
         demo_page = QWidget()
-        dp = hbox(spacing=8)
-        self.demo_rate_spin = QSpinBox()
-        self.demo_rate_spin.setRange(1, 2000)
-        self.demo_rate_spin.setValue(500)
-        self.demo_rate_spin.setSuffix(" Hz")
-        self.demo_rate_spin.setFixedWidth(104)
-        dp.addWidget(self.demo_rate_spin)
-        self.demo_channels_spin = QSpinBox()
-        self.demo_channels_spin.setRange(1, MAX_CHANNELS)
-        self.demo_channels_spin.setValue(3)
-        self.demo_channels_spin.setFixedWidth(72)
-        dp.addWidget(self.demo_channels_spin)
+        dp = hbox(spacing=4)
+        self.demo_rate_combo = _NumberCombo(
+            ["100", "200", "500", "1000", "2000"], "500"
+        )
+        self.demo_rate_combo.setFixedWidth(70)
+        self.demo_rate_combo.setToolTip("模拟数据采样率：下拉选择，或双击直接输入")
+        dp.addWidget(make_label("采样率", "muted"))
+        dp.addWidget(self.demo_rate_combo)
+        dp.addWidget(make_label("Hz", "muted"))
         demo_page.setLayout(dp)
-
-        for spin in (self.net_port_spin, self.demo_rate_spin, self.demo_channels_spin):
-            spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
 
         self.param_stack = QStackedWidget()
         self.param_stack.addWidget(serial_page)
@@ -473,8 +695,9 @@ class MainWindow(QMainWindow):
 
         self.link_btn = QPushButton("连接")
         self.link_btn.setObjectName("primary")
-        self.link_btn.setFixedWidth(76)
-        self.link_btn.setToolTip("连接 / 断开接口；模拟模式下用于开始 / 暂停模拟数据流")
+        self.link_btn.setFixedWidth(82)
+        self.link_btn.setFixedHeight(34)
+        self.link_btn.setToolTip("连接 / 断开；模拟模式下等价于开始 / 暂停模拟数据")
         self.link_btn.clicked.connect(self.toggle_link)
         lay.addWidget(self.link_btn)
 
@@ -482,21 +705,40 @@ class MainWindow(QMainWindow):
 
         self.mode_tag = QPushButton("● 模拟模式")
         self.mode_tag.setObjectName("primary")
-        self.mode_tag.setFixedWidth(112)
+        self.mode_tag.setMinimumWidth(104)
+        self.mode_tag.setFixedHeight(34)
         self.mode_tag.setToolTip("点击开始 / 暂停模拟数据流")
         self.mode_tag.clicked.connect(self.toggle_demo)
         lay.addWidget(self.mode_tag)
 
-        shot_btn = QPushButton("截图")
-        shot_btn.clicked.connect(self.save_screenshot)
-        lay.addWidget(shot_btn)
-
-        clear_btn = QPushButton("清空波形")
-        clear_btn.clicked.connect(self.clear_plot)
-        lay.addWidget(clear_btn)
+        # 截图 / 清空在波形卡片的统计栏里有图标入口，这里不再重复放，避免顶栏过挤
 
         top.setLayout(lay)
         return top
+
+    # ================= 设置 / 主题 =================
+    def open_settings(self) -> None:
+        dialog = SettingsDialog(self.dark, self)
+        dialog.themeChanged.connect(self.apply_theme)
+        dialog.exec()
+
+    def apply_theme(self, dark: bool, remember: bool = True) -> None:
+        """浅色 / 深色切换：全局样式表、波形页与状态栏提示一起更新。"""
+        dark = bool(dark)
+        changed = dark != getattr(self, "dark", None)
+        self.dark = dark
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(app_style(dark))
+        for page in getattr(self, "pages", []):
+            page.set_dark(dark)
+        apply_dark_titlebar(self, dark)
+        if remember:
+            save_dark_setting(dark)
+        if changed and hasattr(self, "statusBar"):
+            self.statusBar().showMessage(
+                "已切换到深色模式" if dark else "已切换到浅色模式", 1500
+            )
 
     def build_rail(self) -> QWidget:
         rail = QFrame()
@@ -531,7 +773,7 @@ class MainWindow(QMainWindow):
         head.addStretch(1)
         add_btn = QToolButton()
         add_btn.setObjectName("addCmd")
-        add_btn.setIcon(icon("plus", 18, "#4B6078"))
+        add_btn.setIcon(icon("plus", 18, ICON_NEUTRAL))
         add_btn.setFixedSize(30, 30)
         add_btn.setIconSize(QSize(18, 18))
         add_btn.setToolTip("新增固定命令 / 滑动条 / 滑块组")
@@ -585,25 +827,25 @@ class MainWindow(QMainWindow):
 
         # 信息栏
         self.info_bar = QWidget()
-        info_l = hbox((10, 8, 10, 8), 12)
+        info_l = hbox((10, 8, 10, 8), 8)
         self.dt_spin = QDoubleSpinBox()
         self.dt_spin.setRange(0.01, 10000)
         self.dt_spin.setDecimals(2)
         self.dt_spin.setValue(1.0)
-        self.dt_spin.setFixedWidth(96)
+        self.dt_spin.setFixedWidth(78)
         self.dt_spin.valueChanged.connect(self.on_dt_changed)
 
         self.buffer_spin = QSpinBox()
         self.buffer_spin.setRange(1000, 500000)
         self.buffer_spin.setSingleStep(1000)
         self.buffer_spin.setValue(50000)
-        self.buffer_spin.setFixedWidth(110)
+        self.buffer_spin.setFixedWidth(88)
         self.buffer_spin.valueChanged.connect(self.on_buffer_changed)
 
         self.align_spin = QSpinBox()
         self.align_spin.setRange(100, 10000)
         self.align_spin.setValue(1200)
-        self.align_spin.setFixedWidth(96)
+        self.align_spin.setFixedWidth(80)
         self.align_spin.valueChanged.connect(self.on_align_changed)
         for spin in (self.dt_spin, self.buffer_spin, self.align_spin):
             spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
@@ -612,27 +854,16 @@ class MainWindow(QMainWindow):
         info_l.addWidget(self.dt_spin)
         info_l.addWidget(make_label("ms"))
         info_l.addSpacing(10)
-        info_l.addWidget(make_label("缓冲区上限:", "sectionBlue"))
+        info_l.addWidget(make_label("缓冲:", "sectionBlue"))
         info_l.addWidget(self.buffer_spin)
         info_l.addWidget(make_label("/ch"))
         info_l.addSpacing(10)
-        info_l.addWidget(make_label("Auto点数对齐:", "sectionBlue"))
+        info_l.addWidget(make_label("点数:", "sectionBlue"))
         info_l.addWidget(self.align_spin)
         info_l.addStretch(1)
 
         self.auto_label = QPushButton("Auto")
         self.auto_label.setObjectName("autoBtn")
-        self.auto_label.setStyleSheet(
-            "QPushButton#autoBtn {"
-            "  font-size:17px; font-style:italic; font-weight:800;"
-            "  color:#9AA8B8; background:transparent; border:1px solid transparent;"
-            "  border-radius:7px; padding:2px 12px;"
-            "}"
-            "QPushButton#autoBtn:hover { color:#2D7EF1; background:#EEF5FF; }"
-            "QPushButton#autoBtn:checked {"
-            "  color:#2D7EF1; background:#E8F1FF; border-color:#CFE0F8;"
-            "}"
-        )
         self.auto_label.setCheckable(True)
         self.auto_label.setChecked(True)
         self.auto_label.setToolTip(
@@ -648,7 +879,7 @@ class MainWindow(QMainWindow):
         stat_l = hbox((10, 2, 10, 6), 14)
         del_btn = QToolButton()
         del_btn.setObjectName("flatTool")
-        del_btn.setIcon(icon("trash", 18, "#7B8798"))
+        del_btn.setIcon(icon("trash", 18, ICON_NEUTRAL))
         del_btn.setToolTip("清空波形")
         del_btn.clicked.connect(self.clear_plot)
         stat_l.addWidget(del_btn)
@@ -660,7 +891,7 @@ class MainWindow(QMainWindow):
         )
         self.scale_label = QLabel("0ms/X-div")
         self.scale_label.setStyleSheet(
-            "color:#276DD7;font-family:Consolas;font-size:13px;font-weight:700;"
+            "color:#3F86EA;font-family:Consolas;font-size:13px;font-weight:700;"
         )
         stat_l.addWidget(self.rx_count_label)
         stat_l.addWidget(make_label("/ 0", "muted"))
@@ -670,7 +901,7 @@ class MainWindow(QMainWindow):
 
         self.rate_label = QLabel("0 KB/s")
         self.rate_label.setStyleSheet(
-            "color:#7B8798;font-family:Consolas;font-size:12px;"
+            "color:#7E8FA6;font-family:Consolas;font-size:12px;"
         )
         self.rate_label.setToolTip("接收吞吐与帧率")
         stat_l.addWidget(self.rate_label)
@@ -678,21 +909,21 @@ class MainWindow(QMainWindow):
 
         self.csv_btn = QToolButton()
         self.csv_btn.setObjectName("flatTool")
-        self.csv_btn.setIcon(icon("docs", 18, "#4B6078"))
+        self.csv_btn.setIcon(icon("docs", 18, ICON_NEUTRAL))
         self.csv_btn.setToolTip("导出曲线数据（CSV）")
         self.csv_btn.clicked.connect(self.export_csv)
         stat_l.addWidget(self.csv_btn)
 
         self.img_btn = QToolButton()
         self.img_btn.setObjectName("flatTool")
-        self.img_btn.setIcon(icon("layers", 18, "#4B6078"))
+        self.img_btn.setIcon(icon("layers", 18, ICON_NEUTRAL))
         self.img_btn.setToolTip("导出曲线图片（PNG）")
         self.img_btn.clicked.connect(self.save_screenshot)
         stat_l.addWidget(self.img_btn)
 
         self.more_btn = QToolButton()
         self.more_btn.setObjectName("flatTool")
-        self.more_btn.setIcon(icon("more", 18, "#4B6078"))
+        self.more_btn.setIcon(icon("more", 18, ICON_NEUTRAL))
         self.more_btn.setToolTip("更多")
         self.more_btn.clicked.connect(self.show_variable_menu)
         stat_l.addWidget(self.more_btn)
@@ -734,7 +965,7 @@ class MainWindow(QMainWindow):
 
         clear_log_btn = QToolButton()
         clear_log_btn.setObjectName("flatTool")
-        clear_log_btn.setIcon(icon("trash", 20, "#4B6078"))
+        clear_log_btn.setIcon(icon("trash", 20, ICON_NEUTRAL))
         clear_log_btn.setIconSize(QSize(20, 20))
         clear_log_btn.setToolTip("清空接收日志")
         clear_log_btn.clicked.connect(self.clear_log)
@@ -772,6 +1003,17 @@ class MainWindow(QMainWindow):
         font_down.clicked.connect(lambda: self.bump_log_font(-1))
         tools.addWidget(font_down)
 
+        # 这几个文字按钮偏窄时会被 QSS 的内边距吃掉，留出余量，高 DPI 下也不会裁字
+        for btn, min_width in (
+            (self.btn_ascii, 46),
+            (self.btn_rx, 44),
+            (self.btn_tx, 44),
+            (self.btn_stamp, 44),
+            (font_up, 34),
+            (font_down, 34),
+        ):
+            btn.setMinimumWidth(min_width)
+
         self.encoding_btn = QToolButton()
         self.encoding_btn.setObjectName("flatTool")
         self.encoding_btn.setText("⌁ UTF-8")
@@ -790,7 +1032,7 @@ class MainWindow(QMainWindow):
 
         save_log_btn = QToolButton()
         save_log_btn.setObjectName("flatTool")
-        save_log_btn.setIcon(icon("docs", 20, "#4B6078"))
+        save_log_btn.setIcon(icon("docs", 20, ICON_NEUTRAL))
         save_log_btn.setIconSize(QSize(20, 20))
         save_log_btn.setToolTip("保存接收日志")
         save_log_btn.clicked.connect(self.save_log)
@@ -798,7 +1040,7 @@ class MainWindow(QMainWindow):
 
         focus_btn = QToolButton()
         focus_btn.setObjectName("flatTool")
-        focus_btn.setIcon(icon("settings", 20, "#4B6078"))
+        focus_btn.setIcon(icon("settings", 20, ICON_NEUTRAL))
         focus_btn.setIconSize(QSize(20, 20))
         focus_btn.setToolTip("聚焦发送框")
         focus_btn.clicked.connect(lambda: self.tx_edit.setFocus())
@@ -858,7 +1100,7 @@ class MainWindow(QMainWindow):
         head.addStretch(1)
         self.right_more = QToolButton()
         self.right_more.setObjectName("flatTool")
-        self.right_more.setIcon(icon("more", 18, "#7B8798"))
+        self.right_more.setIcon(icon("more", 18, ICON_NEUTRAL))
         self.right_more.setToolTip("变量与显示设置")
         self.right_more.clicked.connect(self.show_variable_menu)
         head.addWidget(self.right_more)
@@ -948,7 +1190,7 @@ class MainWindow(QMainWindow):
         return self.pages[0]
 
     def _create_page(self) -> None:
-        page = PlotPage()
+        page = PlotPage(dark=self.dark)
         page.set_adjust_mode(self.mouse_adjust)
         page.set_channel_count(self.channel_count)
         page.set_auto_scale(
@@ -1124,8 +1366,8 @@ class MainWindow(QMainWindow):
         self.scale_label.setText(f"{per_div:.0f}ms/X-div")
 
     def generate_demo_data(self) -> None:
-        rate = max(1, self.demo_rate_spin.value())
-        channels = max(1, min(self.demo_channels_spin.value(), MAX_CHANNELS))
+        rate = self.demo_rate_combo.int_value()
+        channels = DEMO_CHANNELS
         per_frame = rate / 30.0
         frames = int(per_frame) + (1 if self._demo_remainder_add(per_frame) else 0)
         if frames <= 0:
@@ -1337,10 +1579,10 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"日志已保存：{path}", 4000)
 
     def _apply_log_font(self) -> None:
+        # 只覆盖字号，配色交给全局样式表，这样深色模式才能跟着变
         size = self._log_font_size
         self.rx_text.setStyleSheet(
-            "QPlainTextEdit{background:#FFFFFF;color:#364A61;border:0px;"
-            "selection-background-color:#C6DCFF;"
+            "QPlainTextEdit{"
             f"font-family:Consolas,'Microsoft YaHei UI';font-size:{size}px;}}"
         )
 
@@ -1394,7 +1636,7 @@ class MainWindow(QMainWindow):
             self.mode_tag.setText("● 模拟模式")
             self.mode_tag.setObjectName("primary")
             self.statusBar().showMessage(
-                "已进入模拟模式：点击右上角「模拟模式」或顶栏「开始」运行模拟数据", 4000
+                "已进入模拟模式：点击右上角「模拟模式」或顶栏「连接」开始输出模拟数据", 4000
             )
         else:
             self.demo_enabled = False
@@ -1538,11 +1780,12 @@ class MainWindow(QMainWindow):
         if connected:
             self.link_btn.setText("暂停" if demo else "断开")
             self.link_btn.setObjectName("danger")
-            self.link_btn.setStyleSheet("QPushButton{color:#C74B5C;font-weight:700;}")
         else:
-            self.link_btn.setText("开始" if demo else "连接")
+            self.link_btn.setText("连接")
             self.link_btn.setObjectName("primary")
-            self.link_btn.setStyleSheet("")
+        # objectName 变了要重新 polish，否则旧的背景 / 文字色会残留
+        self.link_btn.style().unpolish(self.link_btn)
+        self.link_btn.style().polish(self.link_btn)
 
     def _connect(self) -> None:
         name = self.interface_name
@@ -2141,7 +2384,7 @@ def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName("VOFA+ Flash")
     app.setWindowIcon(app_icon())
-    app.setStyleSheet(APP_STYLE)
+    app.setStyleSheet(app_style(load_dark_setting()))
     window = MainWindow()
     window.show()
     sys.exit(app.exec())

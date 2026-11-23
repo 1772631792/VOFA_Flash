@@ -23,13 +23,38 @@ from PySide6.QtWidgets import QLabel
 from .theme import CHANNEL_COLORS
 
 MAX_CHANNELS = 8
-
-PLOT_BG = "#FFFFFF"
-AXIS_PEN = "#D5DEEA"
-TICK_TEXT = "#8A99AC"
-GRID_ALPHA = 0.5
-CURSOR_PEN = QColor(96, 140, 196, 120)
 Y_SMOOTH = 0.45
+
+PLOT_THEMES = {
+    "light": {
+        "bg": "#FFFFFF",
+        "border": "#D5DEEA",
+        "tick": "#8A99AC",
+        "grid_alpha": 0.5,
+        "legend_brush": (255, 255, 255, 232),
+        "legend_text": "#5B6B80",
+        "watermark": (160, 186, 220, 34),
+        "hint": (150, 168, 190, 190),
+        "cursor": (96, 140, 196, 120),
+        "readout_bg": "rgba(255, 255, 255, 244)",
+        "readout_border": "#E2E9F2",
+        "readout_text": "#4A5B70",
+    },
+    "dark": {
+        "bg": "#1E1E1E",
+        "border": "#3C3C3C",
+        "tick": "#9D9D9D",
+        "grid_alpha": 0.5,
+        "legend_brush": (37, 37, 38, 236),
+        "legend_text": "#CCCCCC",
+        "watermark": (255, 255, 255, 14),
+        "hint": (140, 140, 140, 190),
+        "cursor": (120, 170, 255, 120),
+        "readout_bg": "rgba(37, 37, 38, 246)",
+        "readout_border": "#3C3C3C",
+        "readout_text": "#D4D4D4",
+    },
+}
 
 pg.setConfigOptions(antialias=True)
 
@@ -42,8 +67,11 @@ class PlotPage(pg.PlotWidget):
     contextMenuRequested = Signal(object)
     autoScaleRequested = Signal(bool)
 
-    def __init__(self, parent=None):
-        super().__init__(parent=parent, background=PLOT_BG)
+    def __init__(self, parent=None, dark: bool = False):
+        pal = PLOT_THEMES["dark" if dark else "light"]
+        self._palette = pal
+        self._dark = bool(dark)
+        super().__init__(parent=parent, background=pal["bg"])
         self.setMouseTracking(True)
         self.setMinimumHeight(180)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -53,37 +81,33 @@ class PlotPage(pg.PlotWidget):
         plot.hideButtons()
         plot.setMenuEnabled(False)
         plot.setContentsMargins(4, 6, 14, 4)
-        plot.getViewBox().setBorder(pg.mkPen(AXIS_PEN))
+        plot.getViewBox().setBorder(pg.mkPen(pal["border"]))
         plot.getViewBox().setMouseEnabled(x=True, y=True)
         plot.getViewBox().setDefaultPadding(0.01)
 
         for axis_name in ("left", "bottom"):
             axis = plot.getAxis(axis_name)
-            axis.setPen(pg.mkPen(AXIS_PEN))
-            axis.setTextPen(pg.mkPen(TICK_TEXT))
+            axis.setPen(pg.mkPen(pal["border"]))
+            axis.setTextPen(pg.mkPen(pal["tick"]))
             axis.setTickFont(QFont("Consolas", 9))
             axis.setStyle(tickLength=-4, tickTextOffset=8, autoExpandTextSpace=False)
-        plot.showGrid(x=True, y=True, alpha=GRID_ALPHA)
+        plot.showGrid(x=True, y=True, alpha=pal["grid_alpha"])
         plot.hideAxis("top")
         plot.hideAxis("right")
         plot.setLabel("bottom", "时间 / ms")
         if hasattr(plot.getAxis("bottom"), "label"):
-            plot.getAxis("bottom").label.setDefaultTextColor(QColor(TICK_TEXT))
+            plot.getAxis("bottom").label.setDefaultTextColor(QColor(pal["tick"]))
         plot.setXRange(0, 1200, padding=0)
         plot.setYRange(-5, 5, padding=0)
 
         # ---- 水印（挂在 ViewBox 上，使用像素坐标居中） ----
-        self.watermark = pg.TextItem(
-            "VOFA", anchor=(0.5, 0.5), color=(160, 186, 220, 34)
-        )
+        self.watermark = pg.TextItem("VOFA", anchor=(0.5, 0.5), color=pal["watermark"])
         self.watermark.setFont(QFont("Segoe UI", 44, QFont.Weight.Bold))
         self.watermark.setZValue(-20)
         # 直接挂到 ViewBox 上：这样坐标是像素坐标，可以稳定居中且不随数据平移
         self.watermark.setParentItem(plot.getViewBox())
 
-        self.hint = pg.TextItem(
-            "等待数据…", anchor=(0.5, 0.5), color=(150, 168, 190, 190)
-        )
+        self.hint = pg.TextItem("等待数据…", anchor=(0.5, 0.5), color=pal["hint"])
         self.hint.setFont(QFont("Microsoft YaHei UI", 12))
         self.hint.setZValue(-19)
         self.hint.setParentItem(plot.getViewBox())
@@ -105,9 +129,9 @@ class PlotPage(pg.PlotWidget):
         # ---- 图例 ----
         self.legend = pg.LegendItem(
             offset=(-12, 12),
-            brush=pg.mkBrush(255, 255, 255, 232),
-            pen=pg.mkPen("#E4EAF3"),
-            labelTextColor="#5B6B80",
+            brush=pg.mkBrush(*pal["legend_brush"]),
+            pen=pg.mkPen(pal["border"]),
+            labelTextColor=pal["legend_text"],
             labelTextSize="8pt",
             horSpacing=10,
             verSpacing=1,
@@ -122,12 +146,12 @@ class PlotPage(pg.PlotWidget):
         self._vline = pg.InfiniteLine(
             angle=90,
             movable=False,
-            pen=pg.mkPen(CURSOR_PEN, width=1, style=Qt.PenStyle.DashLine),
+            pen=pg.mkPen(pal["cursor"], width=1, style=Qt.PenStyle.DashLine),
         )
         self._hline = pg.InfiniteLine(
             angle=0,
             movable=False,
-            pen=pg.mkPen(CURSOR_PEN, width=1, style=Qt.PenStyle.DashLine),
+            pen=pg.mkPen(pal["cursor"], width=1, style=Qt.PenStyle.DashLine),
         )
         for line in (self._vline, self._hline):
             line.setZValue(40)
@@ -139,17 +163,7 @@ class PlotPage(pg.PlotWidget):
             Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
         )
         self._readout.setTextFormat(Qt.TextFormat.RichText)
-        self._readout.setStyleSheet(
-            "QLabel {"
-            " background: rgba(255, 255, 255, 244);"
-            " border: 1px solid #E2E9F2;"
-            " border-radius: 8px;"
-            " padding: 6px 10px;"
-            " color: #4A5B70;"
-            " font-family: Consolas, 'Microsoft YaHei UI';"
-            " font-size: 12px;"
-            "}"
-        )
+        self._readout.setStyleSheet(self._readout_qss(pal))
         self._readout.hide()
 
         # ---- 数据 ----
@@ -176,6 +190,55 @@ class PlotPage(pg.PlotWidget):
         self._last_mouse: QPointF | None = None
 
         plot.getViewBox().sigRangeChangedManually.connect(self._on_manual_range)
+
+    # ---------- 主题 ----------
+    @staticmethod
+    def _readout_qss(pal: dict) -> str:
+        return (
+            "QLabel {"
+            f" background: {pal['readout_bg']};"
+            f" border: 1px solid {pal['readout_border']};"
+            " border-radius: 8px;"
+            " padding: 6px 10px;"
+            f" color: {pal['readout_text']};"
+            " font-family: Consolas, 'Microsoft YaHei UI';"
+            " font-size: 12px;"
+            "}"
+        )
+
+    def is_dark(self) -> bool:
+        return self._dark
+
+    def set_dark(self, dark: bool) -> None:
+        """切换深浅配色：画布、坐标轴、网格、图例、游标与读数面板一起变。"""
+        dark = bool(dark)
+        if dark == self._dark:
+            return
+        self._dark = dark
+        pal = PLOT_THEMES["dark" if dark else "light"]
+        self._palette = pal
+        self.setBackground(pal["bg"])
+
+        plot = self.getPlotItem()
+        plot.getViewBox().setBorder(pg.mkPen(pal["border"]))
+        for axis_name in ("left", "bottom"):
+            axis = plot.getAxis(axis_name)
+            axis.setPen(pg.mkPen(pal["border"]))
+            axis.setTextPen(pg.mkPen(pal["tick"]))
+            if hasattr(axis, "label"):
+                axis.label.setDefaultTextColor(QColor(pal["tick"]))
+        plot.showGrid(x=True, y=True, alpha=pal["grid_alpha"])
+
+        self.legend.setBrush(pg.mkBrush(*pal["legend_brush"]))
+        self.legend.setPen(pg.mkPen(pal["border"]))
+        self.legend.setLabelTextColor(pal["legend_text"])
+        self.watermark.setColor(pal["watermark"])
+        self.hint.setColor(pal["hint"])
+        cursor_pen = pg.mkPen(pal["cursor"], width=1, style=Qt.PenStyle.DashLine)
+        self._vline.setPen(cursor_pen)
+        self._hline.setPen(cursor_pen)
+        self._readout.setStyleSheet(self._readout_qss(pal))
+        self.update()
 
     # ---------- 数据 ----------
     def append_sample(self, values: list[float]) -> None:

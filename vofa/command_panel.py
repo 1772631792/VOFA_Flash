@@ -233,6 +233,10 @@ class _TitleLabel(QLabel):
     doubleClicked = Signal()
     rightClicked = Signal(object)
 
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(text, parent)
+        self.setCursor(Qt.PointingHandCursor)
+
     def mouseDoubleClickEvent(self, event) -> None:
         self.doubleClicked.emit()
         event.accept()
@@ -455,6 +459,8 @@ class CommandItem(QFrame):
         send_btn = QPushButton("发送")
         send_btn.setObjectName("primary")
         send_btn.setFixedSize(56, 26)
+        send_btn.setCursor(Qt.PointingHandCursor)
+        send_btn.setToolTip("立即发送该命令")
         send_btn.clicked.connect(lambda: self.send_requested.emit(self))
         top.addWidget(send_btn)
 
@@ -466,8 +472,9 @@ class CommandItem(QFrame):
             "border-radius:6px;padding:0px;}"
             "QToolButton#cmdClose:hover{background:rgba(199,75,92,0.12);}"
         )
-        close_btn.setIcon(icon("close", 18, "#8A97A8"))
+        close_btn.setIcon(icon("close", 18, "#7C8CA0"))
         close_btn.setIconSize(QSize(16, 16))
+        close_btn.setCursor(Qt.PointingHandCursor)
         close_btn.setFixedSize(24, 24)
         close_btn.setToolTip("删除整个滑块组" if self.group else "删除该命令")
         close_btn.clicked.connect(lambda: self.remove_requested.emit(self))
@@ -533,8 +540,8 @@ class CommandItem(QFrame):
         rgb = QColor(color)
         r, g, b = rgb.red(), rgb.green(), rgb.blue()
         self.setStyleSheet(
-            f"QFrame#infoCard{{background:rgba({r},{g},{b},0.07);"
-            f"border:1px solid rgba({r},{g},{b},0.38);"
+            f"QFrame#infoCard{{background:rgba({r},{g},{b},0.13);"
+            f"border:1px solid rgba({r},{g},{b},0.45);"
             f"border-left:4px solid {color};"
             "border-radius:10px;}}"
         )
