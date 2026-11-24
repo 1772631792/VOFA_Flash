@@ -77,6 +77,76 @@ def parse_hex_bytes(text: str) -> bytes:
     return bytes.fromhex(cleaned)
 
 
+_ESCAPES = {
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+    "0": "\0",
+    "\\": "\\",
+    '"': '"',
+    "'": "'",
+}
+_TEXT_PREFIXES = ("text:", "str:", "t:", "文本:")
+_HEX_PREFIXES = ("hex:", "x:")
+
+
+def _unescape(text: str) -> str:
+    """把 '\\r\\n' 这类转义写法还原成真实字符，其它反斜杠保持原样。"""
+    out: list[str] = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == "\\" and index + 1 < len(text):
+            nxt = text[index + 1]
+            out.append(_ESCAPES.get(nxt, "\\" + nxt))
+            index += 2
+            continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def _strip_quotes(text: str) -> str:
+    text = text.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        return text[1:-1]
+    return text
+
+
+def looks_like_hex(text: str) -> bool:
+    """判断是否只由十六进制字符（可带分隔符）组成，且位数为偶数。"""
+    cleaned = re.sub(r"0[xX]", " ", text or "")
+    cleaned = re.sub(r"[\s,,;;:_-]+", "", cleaned)
+    if not cleaned or len(cleaned) % 2:
+        return False
+    return re.fullmatch(r"[0-9a-fA-F]+", cleaned) is not None
+
+
+def parse_frame_bytes(text: str, encoding: str = "utf-8") -> bytes:
+    """头帧 / 尾帧 / 固定内容的通用解析，Hex 与文本都直接支持。
+
+    * 十六进制：`AA 55`、`0xAA,0x55`、`AA55`
+    * 文本：`text:AT+RESET\\r\\n`，或给内容加引号 `"hello"`
+    * 自动：全是十六进制字符按 Hex 解析，出现其它字符（如字母 G~Z）按文本编码
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return b""
+    lowered = raw.lower()
+    for prefix in _HEX_PREFIXES:
+        if lowered.startswith(prefix):
+            return parse_hex_bytes(raw[len(prefix):])
+    for prefix in _TEXT_PREFIXES:
+        if lowered.startswith(prefix):
+            body = _strip_quotes(raw[len(prefix):])
+            return _unescape(body).encode(encoding, errors="replace")
+    if raw[0] in "\"'":
+        return _unescape(_strip_quotes(raw)).encode(encoding, errors="replace")
+    if looks_like_hex(raw):
+        return parse_hex_bytes(raw)
+    return _unescape(raw).encode(encoding, errors="replace")
+
+
 def pack_number(value: float, dtype: str = "float32", big_endian: bool = False) -> bytes:
     """按数据类型与字节序打包单个数值。"""
     fmt, size = _FMT.get(dtype, _FMT["float32"])
@@ -386,11 +456,11 @@ class CommandItem(QFrame):
     def refresh(self) -> None:
         self._rebuild()
 
-    def head_bytes(self) -> bytes:
-        return parse_hex_bytes(self.head_text) if self.head_enabled else b""
+    def head_bytes(self, encoding: str = "utf-8") -> bytes:
+        return parse_frame_bytes(self.head_text, encoding) if self.head_enabled else b""
 
-    def tail_bytes(self) -> bytes:
-        return parse_hex_bytes(self.tail_text) if self.tail_enabled else b""
+    def tail_bytes(self, encoding: str = "utf-8") -> bytes:
+        return parse_frame_bytes(self.tail_text, encoding) if self.tail_enabled else b""
 
     def pack_payload(self) -> bytes:
         return pack_number(self.value, self.dtype, self.big_endian)
@@ -789,12 +859,13 @@ class CommandDialog(QDialog):
         fixed_lay.setSpacing(6)
         self.content_edit = QLineEdit(settings.get("content", ""))
         self.content_edit.setObjectName("mono")
-        self.content_edit.setPlaceholderText("01 03 00 00 00 01 84 0A")
+        self.content_edit.setPlaceholderText('01 03 00 00 00 01 84 0A  或  text:AT+RESET\\r\\n')
         fixed_lay.addLayout(self._row("内容", self.content_edit))
         hint = _label(
-            "Hex 模式按十六进制字节发送，文本模式按当前编码发送。"
+            "内容可以直接写 Hex（AA 55），也可以直接写文本（text:AT+RESET\\r\\n 或 "
+            '加引号 "hello"）：全是十六进制字符按 Hex 发送，其它按当前编码发送。'
             if hex_mode
-            else "当前为文本模式，内容按所选编码发送。",
+            else "当前为文本模式，内容按所选编码发送；也可以写 hex: 前缀强制按十六进制发送。",
             "tinyMuted",
         )
         hint.setWordWrap(True)
@@ -876,7 +947,7 @@ class CommandDialog(QDialog):
         self.head_check.setChecked(bool(settings.get("head_enabled", False)))
         self.head_edit = QLineEdit(settings.get("head_text", ""))
         self.head_edit.setObjectName("mono")
-        self.head_edit.setPlaceholderText("AA 55")
+        self.head_edit.setPlaceholderText('AA 55  或  text:AT+RESET\\r\\n')
         self.head_edit.setEnabled(self.head_check.isChecked())
         self.head_check.toggled.connect(self.head_edit.setEnabled)
         frame_row.addWidget(self.head_check)
@@ -889,7 +960,7 @@ class CommandDialog(QDialog):
         self.tail_check.setChecked(bool(settings.get("tail_enabled", False)))
         self.tail_edit = QLineEdit(settings.get("tail_text", ""))
         self.tail_edit.setObjectName("mono")
-        self.tail_edit.setPlaceholderText("00 00 80 7F")
+        self.tail_edit.setPlaceholderText('00 00 80 7F  或  text:\\r\\n')
         self.tail_edit.setEnabled(self.tail_check.isChecked())
         self.tail_check.toggled.connect(self.tail_edit.setEnabled)
         tail_row.addWidget(self.tail_check)
@@ -897,8 +968,10 @@ class CommandDialog(QDialog):
         lay.addLayout(tail_row)
 
         frame_hint = _label(
-            "头帧 / 尾帧按 Hex 解析，可单独启用或组合使用；"
-            "绑定组时以组内第一个滑块的帧配置为准。",
+            "头帧 / 尾帧可以直接写 Hex（AA 55、0xAA），也可以直接写文本"
+            "（text:AT+RESET\\r\\n，或给内容加英文引号）：全是十六进制字符按 Hex 解析，"
+            "出现其它字符按当前编码发送，支持 \\r \\n \\t 转义。"
+            "可单独启用或组合使用；绑定组时以组内第一个滑块的帧配置为准。",
             "tinyMuted",
         )
         frame_hint.setWordWrap(True)
@@ -951,9 +1024,9 @@ class CommandDialog(QDialog):
         ):
             if check.isChecked():
                 try:
-                    parse_hex_bytes(edit.text())
+                    parse_frame_bytes(edit.text(), "utf-8")
                 except ValueError:
-                    self._warn(f"{name}不是合法的十六进制字节串。")
+                    self._warn(f"{name}的 hex: 写法不合法，请检查十六进制位数（需为偶数）。")
                     return
         if self.kind_combo.currentIndex() == 1:
             if self.max_spin.value() <= self.min_spin.value():

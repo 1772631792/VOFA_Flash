@@ -40,7 +40,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .command_panel import CommandDialog, CommandItem, parse_hex_bytes
+from .command_panel import CommandDialog, CommandItem, parse_frame_bytes
 from .icons import app_icon, icon
 from .plot_widget import FFT_SCALES, FFT_WINDOWS, MAX_CHANNELS, PlotPage
 from .protocol import JustFloatParser
@@ -884,9 +884,6 @@ class MainWindow(QMainWindow):
         self._rate_bytes = 0
         self._rate_frames = 0
         self._rate_start = time.monotonic()
-        self._cmd_seq = 0
-        self._slider_seq = 0
-        self._group_seq = 0
         self._data_collapsed = False
         self._right_width = 250
         self._group_colors: dict[str, str] = {}
@@ -2794,19 +2791,33 @@ class MainWindow(QMainWindow):
     def _update_command_hint(self) -> None:
         self.cmd_empty.setVisible(not self._command_widgets())
 
+    def _next_auto_number(self, prefix: str, names: list[str] | None = None) -> int:
+        """自动编号：优先补上被删掉留下的最小空号，避免「删了再加数字一直涨」。"""
+        used: set[int] = set()
+        pattern = re.compile(rf"^{re.escape(prefix)}(\d+)$")
+        source = names if names is not None else [
+            item.title for item in self._command_widgets()
+        ]
+        for name in source:
+            match = pattern.match((name or "").strip())
+            if match:
+                used.add(int(match.group(1)))
+        index = 1
+        while index in used:
+            index += 1
+        return index
+
     def add_command(
         self,
         kind: str = "fixed",
         content: str = "",
         title: str | None = None,
     ) -> CommandItem:
-        """新增一条命令；名称留空时自动编号。"""
+        """新增一条命令；名称留空时自动编号（补空号，不复用已占用的编号）。"""
         if kind == "slider":
-            self._slider_seq += 1
-            item = CommandItem("slider", title or f"滑块{self._slider_seq}", "")
+            item = CommandItem("slider", title or f"滑块{self._next_auto_number('滑块')}", "")
         else:
-            self._cmd_seq += 1
-            item = CommandItem("fixed", title or f"命令{self._cmd_seq}", content)
+            item = CommandItem("fixed", title or f"命令{self._next_auto_number('命令')}", content)
         item.send_requested.connect(self._on_command_send)
         item.remove_requested.connect(self._remove_command)
         item.edit_requested.connect(self._edit_command)
@@ -2826,8 +2837,13 @@ class MainWindow(QMainWindow):
         group: str | None = None,
     ) -> None:
         """一次创建 N 个绑定到同一组的滑动条。"""
-        self._group_seq += 1
-        group = group or f"组{self._group_seq}"
+        if not group:
+            existing = [
+                item.group
+                for item in self._command_widgets()
+                if item.kind == "slider" and item.group
+            ]
+            group = f"组{self._next_auto_number('组', existing)}"
         for _ in range(count):
             item = self.add_command("slider")
             data = item.settings()
@@ -2931,10 +2947,14 @@ class MainWindow(QMainWindow):
                 body = self._encode_command_content(item.content, silent)
                 if body is None:
                     return b""
-                return item.head_bytes() + body + item.tail_bytes()
+                return (
+                    item.head_bytes(self.encoding)
+                    + body
+                    + item.tail_bytes(self.encoding)
+                )
             members = self._group_members(item)
-            head = members[0].head_bytes()
-            tail = members[0].tail_bytes()
+            head = members[0].head_bytes(self.encoding)
+            tail = members[0].tail_bytes(self.encoding)
             body = b"".join(member.pack_payload() for member in members)
             return head + body + tail
         except ValueError:
@@ -2942,23 +2962,26 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(
                     self,
                     "帧格式错误",
-                    "头帧 / 尾帧或命令内容不是合法的十六进制字节串。",
+                    "头帧 / 尾帧或命令内容无法解析：请检查 hex: 写法的十六进制位数是否为偶数。",
                 )
             return b""
 
     def _encode_command_content(self, text: str, silent: bool = False) -> bytes | None:
         if not text.strip():
             return b""
+        stripped = text.strip()
+        forced_hex = stripped.lower().startswith(("hex:", "x:"))
         try:
-            if self.hex_mode:
-                return parse_hex_bytes(text)
+            if self.hex_mode or forced_hex:
+                # Hex 模式也支持直接写文本：出现非十六进制字符时按文本编码发送
+                return parse_frame_bytes(stripped, self.encoding)
             return text.encode(self.encoding, errors="replace")
         except ValueError:
             if not silent:
                 QMessageBox.warning(
                     self,
                     "命令格式错误",
-                    "当前为 Hex 模式，请输入正确的十六进制字节串。",
+                    "hex: 前缀的十六进制位数需为偶数；普通内容可直接写 Hex（AA 55）或文本。",
                 )
             return None
 
