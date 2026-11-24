@@ -3,7 +3,7 @@
 设计要点：
 - 纯白画布 + 极浅网格 + 细描边 + Consolas 刻度，摆脱 pyqtgraph 默认的灰黑配色。
 - 右上角半透明图例，随通道名称 / 颜色 / 可见性实时刷新。
-- 鼠标移入显示十字游标和数值读数面板（含相对时间）。
+- 暂停后鼠标移入显示十字游标和数值读数面板（含相对时间），运行中保持画布干净。
 - Auto 打开时同时自适应 X（跟随最新数据窗口）与 Y（可见数据加边距）；
   手动滚轮缩放或拖动会自动关闭 Auto，避免"Auto 抢拖动"，也让 Auto 按钮确实有反馈。
 """
@@ -22,8 +22,117 @@ from PySide6.QtWidgets import QLabel
 
 from .theme import CHANNEL_COLORS
 
+
+def _font(family: str, size: int, bold: bool = False) -> QFont:
+    font = QFont(family)
+    if size > 0:
+        font.setPointSize(size)
+    font.setBold(bold)
+    return font
+
+
 MAX_CHANNELS = 8
 Y_SMOOTH = 0.45
+
+FFT_WINDOWS = {
+    "hann": "Hann（通用）",
+    "hamming": "Hamming",
+    "blackman": "Blackman",
+    "flattop": "Flat Top（幅值优先）",
+    "rectangular": "矩形窗（整周期）",
+}
+FFT_SCALES = {
+    "percent": "相对基波 (%)",
+    "amplitude": "幅值",
+    "dbc": "相对基波 (dBc)",
+}
+DEFAULT_FFT_SETTINGS = {
+    "window": "hann",
+    "fft_size": 0,
+    "remove_dc": True,
+    "scale": "percent",
+    "db_floor": -100.0,
+    "fundamental_min_hz": 0.5,
+}
+
+
+def _fft_window(name: str, n: int) -> np.ndarray:
+    k = np.arange(n, dtype=float)
+    phase = 2.0 * np.pi * k / n
+    if name == "rectangular":
+        return np.ones(n)
+    if name == "hamming":
+        return 0.54 - 0.46 * np.cos(phase)
+    if name == "blackman":
+        return 0.42 - 0.5 * np.cos(phase) + 0.08 * np.cos(2.0 * phase)
+    if name == "flattop":
+        return (
+            0.21557895
+            - 0.41663158 * np.cos(phase)
+            + 0.27726316 * np.cos(2.0 * phase)
+            - 0.083578947 * np.cos(3.0 * phase)
+            + 0.006947368 * np.cos(4.0 * phase)
+        )
+    return 0.5 - 0.5 * np.cos(phase)
+
+
+def _analyze_spectrum(times_ms: np.ndarray, samples: np.ndarray, settings: dict) -> dict | None:
+    """参考 McuStdio：去均值 + 周期窗 + 单边谱 + 相干增益校正。"""
+    n = min(int(settings.get("fft_size") or 4096), len(samples))
+    while n > 8 and n & (n - 1):
+        n -= 1
+    if n < 8 or len(times_ms) < n:
+        return None
+
+    t = np.asarray(times_ms[-n:], dtype=float)
+    y = np.asarray(samples[-n:], dtype=float)
+    duration = (float(t[-1]) - float(t[0])) / 1000.0
+    if duration <= 0 or not math.isfinite(duration):
+        return None
+    sample_rate = (n - 1) / duration
+
+    uniform_t = np.linspace(float(t[0]), float(t[-1]), n)
+    y = np.interp(uniform_t, t, y)
+    if settings.get("remove_dc", True):
+        y = y - float(np.mean(y))
+
+    window = _fft_window(str(settings.get("window", "hann")), n)
+    coherent = abs(float(np.sum(window))) or 1.0
+    spectrum = np.fft.rfft(y * window)
+    amplitudes = 2.0 * np.abs(spectrum) / coherent
+    amplitudes[0] *= 0.5
+    if n % 2 == 0 and amplitudes.size > 1:
+        amplitudes[-1] *= 0.5
+    frequencies = np.fft.rfftfreq(n, d=1.0 / sample_rate)
+    resolution = sample_rate / n
+
+    min_hz = float(settings.get("fundamental_min_hz", 0.5))
+    min_idx = max(1, int(min_hz / max(resolution, 1e-9)))
+    min_idx = min(min_idx, amplitudes.size - 1)
+    fundamental_idx = min_idx + int(np.argmax(amplitudes[min_idx:]))
+    reference = max(float(amplitudes[fundamental_idx]), 1e-12)
+
+    scale = str(settings.get("scale", "percent"))
+    if scale == "amplitude":
+        values = amplitudes
+    elif scale == "dbc":
+        floor = float(settings.get("db_floor", -100.0))
+        values = np.maximum(
+            20.0 * np.log10(np.maximum(amplitudes / reference, 1e-300)), floor
+        )
+    else:
+        values = amplitudes / reference * 100.0
+
+    return {
+        "frequencies": frequencies,
+        "values": values,
+        "sample_rate": sample_rate,
+        "resolution": resolution,
+        "nyquist": sample_rate * 0.5,
+        "fundamental_hz": float(frequencies[fundamental_idx]),
+        "fft_size": n,
+    }
+
 
 PLOT_THEMES = {
     "light": {
@@ -39,6 +148,9 @@ PLOT_THEMES = {
         "readout_bg": "rgba(255, 255, 255, 244)",
         "readout_border": "#E2E9F2",
         "readout_text": "#4A5B70",
+        "pause_bg": "rgba(236, 245, 255, 246)",
+        "pause_border": "#BBD5F6",
+        "pause_text": "#2B6CB0",
     },
     "dark": {
         "bg": "#1E1E1E",
@@ -53,6 +165,9 @@ PLOT_THEMES = {
         "readout_bg": "rgba(37, 37, 38, 246)",
         "readout_border": "#3C3C3C",
         "readout_text": "#D4D4D4",
+        "pause_bg": "rgba(28, 38, 52, 246)",
+        "pause_border": "#2E4A6B",
+        "pause_text": "#9FC3FF",
     },
 }
 
@@ -60,12 +175,11 @@ pg.setConfigOptions(antialias=True)
 
 
 class PlotPage(pg.PlotWidget):
-    """单个波形标签页：曲线、图例、十字游标、通道可见性与鼠标调参。"""
+    """单个波形标签页：曲线、图例、暂停读数、通道可见性。"""
 
-    gainChanged = Signal(int)
-    offsetChanged = Signal(int)
     contextMenuRequested = Signal(object)
     autoScaleRequested = Signal(bool)
+    activated = Signal(object)
 
     def __init__(self, parent=None, dark: bool = False):
         pal = PLOT_THEMES["dark" if dark else "light"]
@@ -80,7 +194,7 @@ class PlotPage(pg.PlotWidget):
         plot.setClipToView(True)
         plot.hideButtons()
         plot.setMenuEnabled(False)
-        plot.setContentsMargins(4, 6, 14, 4)
+        plot.setContentsMargins(12, 6, 14, 4)
         plot.getViewBox().setBorder(pg.mkPen(pal["border"]))
         plot.getViewBox().setMouseEnabled(x=True, y=True)
         plot.getViewBox().setDefaultPadding(0.01)
@@ -89,7 +203,9 @@ class PlotPage(pg.PlotWidget):
             axis = plot.getAxis(axis_name)
             axis.setPen(pg.mkPen(pal["border"]))
             axis.setTextPen(pg.mkPen(pal["tick"]))
-            axis.setTickFont(QFont("Consolas", 9))
+            tick_font = QFont("Consolas")
+            tick_font.setPointSize(9)
+            axis.setTickFont(tick_font)
             axis.setStyle(tickLength=-4, tickTextOffset=8, autoExpandTextSpace=False)
         plot.showGrid(x=True, y=True, alpha=pal["grid_alpha"])
         plot.hideAxis("top")
@@ -102,13 +218,13 @@ class PlotPage(pg.PlotWidget):
 
         # ---- 水印（挂在 ViewBox 上，使用像素坐标居中） ----
         self.watermark = pg.TextItem("VOFA", anchor=(0.5, 0.5), color=pal["watermark"])
-        self.watermark.setFont(QFont("Segoe UI", 44, QFont.Weight.Bold))
+        self.watermark.setFont(_font("Segoe UI", 44, True))
         self.watermark.setZValue(-20)
         # 直接挂到 ViewBox 上：这样坐标是像素坐标，可以稳定居中且不随数据平移
         self.watermark.setParentItem(plot.getViewBox())
 
         self.hint = pg.TextItem("等待数据…", anchor=(0.5, 0.5), color=pal["hint"])
-        self.hint.setFont(QFont("Microsoft YaHei UI", 12))
+        self.hint.setFont(_font("Microsoft YaHei UI", 12))
         self.hint.setZValue(-19)
         self.hint.setParentItem(plot.getViewBox())
 
@@ -142,6 +258,12 @@ class PlotPage(pg.PlotWidget):
         self.legend.setVisible(False)
         self._legend_key: tuple | None = None
 
+        self.fft_summary = pg.TextItem("", anchor=(0, 0), color=pal["legend_text"])
+        self.fft_summary.setFont(_font("Consolas", 9))
+        self.fft_summary.setParentItem(plot.getViewBox())
+        self.fft_summary.setZValue(55)
+        self.fft_summary.hide()
+
         # ---- 十字游标 ----
         self._vline = pg.InfiniteLine(
             angle=90,
@@ -166,6 +288,16 @@ class PlotPage(pg.PlotWidget):
         self._readout.setStyleSheet(self._readout_qss(pal))
         self._readout.hide()
 
+        self._pause_badge = QLabel(self.viewport())
+        self._pause_badge.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
+        )
+        self._pause_badge.setText("已暂停 · 按空格继续")
+        self._pause_badge.setStyleSheet(self._pause_badge_qss(pal))
+        self._pause_badge.adjustSize()
+        self._pause_badge.move(10, 8)
+        self._pause_badge.hide()
+
         # ---- 数据 ----
         self.channel_count = 0
         self.channel_names = [f"I{i}" for i in range(MAX_CHANNELS)]
@@ -180,8 +312,9 @@ class PlotPage(pg.PlotWidget):
         self.sample_index = 0
         self.has_data = False
         self.auto_scale = True
-        self.adjust_mode = False
-        self._drag_last: QPointF | None = None
+        self.inspect_mode = False
+        self.plot_mode = "time"
+        self.fft_settings = dict(DEFAULT_FFT_SETTINGS)
         self._x: np.ndarray | None = None
         self._ys: list[np.ndarray | None] = [None] * MAX_CHANNELS
         self._filled = [False] * MAX_CHANNELS
@@ -203,6 +336,21 @@ class PlotPage(pg.PlotWidget):
             f" color: {pal['readout_text']};"
             " font-family: Consolas, 'Microsoft YaHei UI';"
             " font-size: 12px;"
+            "}"
+        )
+
+    @staticmethod
+    def _pause_badge_qss(pal: dict) -> str:
+        return (
+            "QLabel {"
+            f" background: {pal['pause_bg']};"
+            f" border: 1px solid {pal['pause_border']};"
+            " border-radius: 12px;"
+            " padding: 5px 10px;"
+            f" color: {pal['pause_text']};"
+            " font-family: Consolas, 'Microsoft YaHei UI';"
+            " font-size: 12px;"
+            " font-weight: 700;"
             "}"
         )
 
@@ -234,10 +382,12 @@ class PlotPage(pg.PlotWidget):
         self.legend.setLabelTextColor(pal["legend_text"])
         self.watermark.setColor(pal["watermark"])
         self.hint.setColor(pal["hint"])
+        self.fft_summary.setColor(QColor(pal["legend_text"]))
         cursor_pen = pg.mkPen(pal["cursor"], width=1, style=Qt.PenStyle.DashLine)
         self._vline.setPen(cursor_pen)
         self._hline.setPen(cursor_pen)
         self._readout.setStyleSheet(self._readout_qss(pal))
+        self._pause_badge.setStyleSheet(self._pause_badge_qss(pal))
         self.update()
 
     # ---------- 数据 ----------
@@ -270,6 +420,7 @@ class PlotPage(pg.PlotWidget):
         self._filled = [False] * MAX_CHANNELS
         self._drawn = False
         self._hide_cursor_readout()
+        self.fft_summary.hide()
         self._place_watermark()
 
     def set_dt(self, dt_ms: float) -> None:
@@ -308,10 +459,59 @@ class PlotPage(pg.PlotWidget):
             self.channel_names[index] = name
             self._legend_key = None
 
-    def set_adjust_mode(self, enabled: bool) -> None:
-        self.adjust_mode = enabled
-        self._drag_last = None
-        self.setCursor(Qt.SizeAllCursor if enabled else Qt.ArrowCursor)
+    def set_inspect_mode(self, enabled: bool) -> None:
+        """暂停时显示暂停徽标；十字游标读数始终可用。"""
+        self.inspect_mode = bool(enabled)
+        if self.inspect_mode:
+            self._pause_badge.show()
+            self._pause_badge.raise_()
+            self._readout.raise_()
+        else:
+            self._pause_badge.hide()
+
+    # ---------- 时域 / FFT ----------
+    def _fft_y_label(self) -> str:
+        return FFT_SCALES.get(str(self.fft_settings.get("scale", "percent")), "相对基波 (%)")
+
+    def set_plot_mode(self, mode: str) -> None:
+        mode = "fft" if mode == "fft" else "time"
+        if mode == self.plot_mode:
+            return
+        self.plot_mode = mode
+        self._y_range = None
+        self._x = None
+        self._ys = [None] * MAX_CHANNELS
+        self._hide_cursor_readout()
+        plot = self.getPlotItem()
+        plot.setLabel("bottom", "频率 / Hz" if mode == "fft" else "时间 / ms")
+        plot.setLabel("left", self._fft_y_label() if mode == "fft" else "")
+        for axis_name in ("left", "bottom"):
+            axis = plot.getAxis(axis_name)
+            if hasattr(axis, "label"):
+                axis.label.setDefaultTextColor(QColor(self._palette["tick"]))
+        self.fft_summary.setVisible(mode == "fft")
+        self.refresh()
+
+    def set_fft_window(self, window: str) -> None:
+        if window not in FFT_WINDOWS:
+            return
+        self.fft_settings["window"] = window
+        if self.plot_mode == "fft":
+            self.refresh()
+
+    def set_fft_scale(self, scale: str) -> None:
+        if scale not in FFT_SCALES:
+            return
+        self.fft_settings["scale"] = scale
+        self._y_range = None
+        if self.plot_mode == "fft":
+            self.getPlotItem().setLabel("left", self._fft_y_label())
+            self.refresh()
+
+    def set_fft_size(self, size: int) -> None:
+        self.fft_settings["fft_size"] = max(0, int(size))
+        if self.plot_mode == "fft":
+            self.refresh()
 
     # ---------- Auto ----------
     def set_auto_scale(self, enabled: bool) -> None:
@@ -342,6 +542,7 @@ class PlotPage(pg.PlotWidget):
                 self.legend.setVisible(False)
             self._x = None
             self._hide_cursor_readout()
+            self.fft_summary.hide()
             self._place_watermark()
             return
 
@@ -351,11 +552,9 @@ class PlotPage(pg.PlotWidget):
             islice(reversed(self.times), 0, shown), dtype=float, count=shown
         )[::-1]
         x = times - times[0]
-        self._x = x
 
         arrays: list[np.ndarray | None] = [None] * MAX_CHANNELS
-        drawn = False
-        for i, curve in enumerate(self.curves):
+        for i in range(MAX_CHANNELS):
             buf = self.buffers[i]
             if (
                 i < self.channel_count
@@ -363,28 +562,87 @@ class PlotPage(pg.PlotWidget):
                 and len(buf) >= shown
                 and shown > 0
             ):
-                y = np.fromiter(
+                arrays[i] = np.fromiter(
                     islice(reversed(buf), 0, shown), dtype=float, count=shown
                 )[::-1]
-                curve.setData(x, y)
                 self._filled[i] = True
-                arrays[i] = y
-                drawn = True
-            elif self._filled[i]:
-                curve.setData([], [])
+            else:
                 self._filled[i] = False
-        self._ys = arrays
-        self._drawn = drawn
 
-        if self.auto_scale:
-            self._fit_view(x, [a for a in arrays if a is not None])
+        if self.plot_mode == "fft":
+            self._draw_fft(times, arrays)
+        else:
+            drawn = False
+            for i, y in enumerate(arrays):
+                if y is None:
+                    self.curves[i].setData([], [])
+                    continue
+                self.curves[i].setData(x, y)
+                drawn = True
+            self._x = x
+            self._ys = arrays
+            self._drawn = drawn
+            self.fft_summary.hide()
+            if self.auto_scale:
+                self._fit_view(x, [a for a in arrays if a is not None])
 
         self._rebuild_legend()
         self._place_watermark()
 
-        # 数据滚动时让十字游标跟随鼠标所指位置重新取值
+        # 数据刷新时同步更新鼠标所指位置的读数
         if self._last_mouse is not None and self._readout.isVisible():
             self._update_cursor_readout(self._last_mouse)
+
+    def _draw_fft(self, times: np.ndarray, arrays: list[np.ndarray | None]) -> None:
+        results: list[tuple[np.ndarray, np.ndarray, dict, float]] = []
+        limit = float(self.fft_settings.get("display_max_hz", 0.0) or 0.0)
+        for i, samples in enumerate(arrays):
+            if samples is None:
+                self.curves[i].setData([], [])
+                arrays[i] = None
+                continue
+            result = _analyze_spectrum(times, samples, self.fft_settings)
+            if result is None:
+                self.curves[i].setData([], [])
+                arrays[i] = None
+                continue
+            max_hz = limit or float(result["nyquist"])
+            freqs = result["frequencies"]
+            values = result["values"]
+            visible = freqs <= max_hz
+            fx, fy = freqs[visible], values[visible]
+            self.curves[i].setData(fx, fy)
+            arrays[i] = fy
+            results.append((fx, fy, result, max_hz))
+
+        self._ys = arrays
+        if not results:
+            self._x = None
+            self._drawn = False
+            self.fft_summary.hide()
+            return
+
+        self._x = results[0][0]
+        self._drawn = True
+        max_hz = max(item[3] for item in results)
+        scale = str(self.fft_settings.get("scale", "percent"))
+        if self.auto_scale:
+            self.setXRange(0.0, max(max_hz, 1.0), padding=0.0)
+            if scale == "dbc":
+                self.setYRange(float(self.fft_settings.get("db_floor", -100.0)), 5.0, padding=0.0)
+            else:
+                finite = [float(np.max(item[1])) for item in results if item[1].size]
+                top = max(finite) if finite else 1.0
+                self.setYRange(0.0, max(top * 1.08, 1.0), padding=0.0)
+
+        first = results[0][2]
+        self.fft_summary.setText(
+            f"FFT · {FFT_WINDOWS.get(str(self.fft_settings.get('window', 'hann')), 'Hann')} · "
+            f"N={first['fft_size']} · Fs={first['sample_rate']:.0f}Hz · "
+            f"Δf={first['resolution']:.2f}Hz · f0={first['fundamental_hz']:.2f}Hz"
+        )
+        self.fft_summary.setPos(10, 8)
+        self.fft_summary.show()
 
     def _fit_view(self, x: np.ndarray, arrays: list[np.ndarray]) -> None:
         """Auto：X 跟随最新窗口，Y 贴合可见数据并留 8% 边距（带轻微平滑）。"""
@@ -490,9 +748,12 @@ class PlotPage(pg.PlotWidget):
         self._vline.setVisible(True)
         self._hline.setVisible(True)
 
+        axis_name = "f" if self.plot_mode == "fft" else "t"
+        unit = "Hz" if self.plot_mode == "fft" else "ms"
+        digits = ".2f" if self.plot_mode == "fft" else ".1f"
         self._readout.setText(
-            "<div style='color:#93A2B5'>t = "
-            f"{float(x[index]):.1f} ms</div>"
+            f"<div style='color:#93A2B5'>{axis_name} = "
+            f"{float(x[index]):{digits}} {unit}</div>"
             "<table cellspacing='0' cellpadding='1'>"
             + "".join(rows)
             + "</table>"
@@ -516,6 +777,12 @@ class PlotPage(pg.PlotWidget):
         self._vline.setVisible(False)
         self._hline.setVisible(False)
 
+    def _place_pause_badge(self) -> None:
+        if hasattr(self, "_pause_badge"):
+            self._pause_badge.move(10, 8)
+            self._pause_badge.raise_()
+            self._readout.raise_()
+
     # ---------- 事件 ----------
     def resizeEvent(self, ev) -> None:
         super().resizeEvent(ev)
@@ -523,36 +790,17 @@ class PlotPage(pg.PlotWidget):
             return  # 基类 __init__ 期间就会触发一次 resizeEvent
         self._place_watermark()
         self._hide_cursor_readout()
+        self._place_pause_badge()
 
     def mousePressEvent(self, ev) -> None:
-        if self.adjust_mode and ev.button() == Qt.LeftButton:
-            self._drag_last = ev.position()
-            self._last_mouse = None
-            self._hide_cursor_readout()
+        self.activated.emit(self)
         super().mousePressEvent(ev)
 
     def mouseMoveEvent(self, ev) -> None:
-        if self.adjust_mode and self._drag_last is not None and ev.buttons() & Qt.LeftButton:
-            pos = ev.position()
-            dx = pos.x() - self._drag_last.x()
-            dy = pos.y() - self._drag_last.y()
-            if abs(dy) >= 6:
-                self.gainChanged.emit(1 if dy < 0 else -1)
-                self._drag_last = pos
-                ev.accept()
-                return
-            if abs(dx) >= 8:
-                self.offsetChanged.emit(1 if dx > 0 else -1)
-                self._drag_last = pos
-                ev.accept()
-                return
         super().mouseMoveEvent(ev)
-        self._last_mouse = ev.position()
-        self._update_cursor_readout(self._last_mouse)
-
-    def mouseReleaseEvent(self, ev) -> None:
-        self._drag_last = None
-        super().mouseReleaseEvent(ev)
+        pos = ev.position()
+        self._last_mouse = pos
+        self._update_cursor_readout(pos)
 
     def leaveEvent(self, ev) -> None:
         self._last_mouse = None

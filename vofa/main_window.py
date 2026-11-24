@@ -1,4 +1,4 @@
-"""VOFA+ Flash 1.0 外观复刻：波形主界面（参考 vofa_demo 布局）。"""
+"""VOFA+ Flash 1.1 外观复刻：波形主界面（参考 vofa_demo 布局）。"""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import sys
 import time
 
 import serial.tools.list_ports
-from PySide6.QtCore import QEvent, QPoint, QSettings, QSize, Qt, QTimer, Signal, Slot
+from PySide6.QtCore import QEvent, QPoint, QPointF, QSettings, QSize, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QSplitter,
     QStackedWidget,
+    QTextEdit,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -41,7 +42,7 @@ from PySide6.QtWidgets import (
 
 from .command_panel import CommandDialog, CommandItem, parse_hex_bytes
 from .icons import app_icon, icon
-from .plot_widget import MAX_CHANNELS, PlotPage
+from .plot_widget import FFT_SCALES, FFT_WINDOWS, MAX_CHANNELS, PlotPage
 from .protocol import JustFloatParser
 from .serial_worker import SerialWorker
 from .theme import CHANNEL_COLORS, GROUP_COLORS, app_style
@@ -53,7 +54,7 @@ from .transport import (
 )
 
 ENGINES = ["JustFloat", "RawData"]
-INTERFACES = ["模拟模式", "串口", "UDP", "TCP客户端", "TCP服务端"]
+INTERFACES = ["串口", "UDP", "TCP客户端", "TCP服务端", "模拟模式"]
 
 SETTINGS_ORG = "VOFAFlash"
 SETTINGS_APP = "VOFAFlash"
@@ -466,10 +467,373 @@ class _NumberCombo(QComboBox):
         return max(low, min(value, high))
 
 
+class LogTextEdit(QPlainTextEdit):
+    """日志区：Ctrl + 滚轮缩放字号，不影响正常滚动。"""
+
+    fontZoomRequested = Signal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.viewport().installEventFilter(self)
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        if (
+            obj is self.viewport()
+            and event.type() == QEvent.Type.Wheel
+            and event.modifiers() & Qt.ControlModifier
+        ):
+            delta = event.angleDelta().y()
+            if delta:
+                self.fontZoomRequested.emit(1 if delta > 0 else -1)
+            return True
+        return super().eventFilter(obj, event)
+
+    def wheelEvent(self, event) -> None:
+        if event.modifiers() & Qt.ControlModifier:
+            delta = event.angleDelta().y()
+            if delta:
+                self.fontZoomRequested.emit(1 if delta > 0 else -1)
+            event.accept()
+            return
+        super().wheelEvent(event)
+
+
+AXIS_COLORS = ("#E05252", "#1F9D67", "#2D7EF1")
+
+
+class TriAxisWidget(QWidget):
+    """轻量三轴姿态视图：根据三个角度旋转 XYZ 轴，不依赖 OpenGL。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.angles = [0.0, 0.0, 0.0]
+        self.unit = "deg"
+        self._dark = False
+        self.setMinimumHeight(170)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+    def set_dark(self, dark: bool) -> None:
+        self._dark = bool(dark)
+        self.update()
+
+    def set_angles(self, angles: list[float]) -> None:
+        self.angles = list(angles) + [0.0] * (3 - len(angles))
+        self.update()
+
+    @staticmethod
+    def _rotate_x(vec, angle: float):
+        x, y, z = vec
+        c, s = math.cos(angle), math.sin(angle)
+        return x, y * c - z * s, y * s + z * c
+
+    @staticmethod
+    def _rotate_y(vec, angle: float):
+        x, y, z = vec
+        c, s = math.cos(angle), math.sin(angle)
+        return x * c + z * s, y, -x * s + z * c
+
+    @staticmethod
+    def _rotate_z(vec, angle: float):
+        x, y, z = vec
+        c, s = math.cos(angle), math.sin(angle)
+        return x * c - y * s, x * s + y * c, z
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        width, height = self.width(), self.height()
+        cx, cy = width / 2.0, height / 2.0 + 4.0
+        scale = max(42.0, min(width, height) * 0.31)
+
+        grid = QColor("#DCE4EF" if not self._dark else "#3C3C3C")
+        painter.setPen(QPen(grid, 1.0, Qt.PenStyle.DashLine))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(QPointF(cx, cy + scale * 0.16), scale * 1.06, scale * 0.46)
+
+        angles = [
+            math.radians(a) if self.unit == "deg" else a for a in self.angles[:3]
+        ]
+        basis = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+        projected = []
+        for index, vec in enumerate(basis):
+            rotated = self._rotate_x(vec, angles[0])
+            rotated = self._rotate_y(rotated, angles[1])
+            rotated = self._rotate_z(rotated, angles[2])
+            rotated = self._rotate_x(rotated, -0.34)
+            rotated = self._rotate_y(rotated, 0.62)
+            projected.append((rotated[2], index, rotated))
+
+        label_font = QFont("Consolas")
+        label_font.setPointSize(10)
+        label_font.setBold(True)
+        painter.setFont(label_font)
+        for _, index, vec in sorted(projected):
+            px = cx + vec[0] * scale
+            py = cy - vec[1] * scale
+            color = QColor(AXIS_COLORS[index])
+            painter.setPen(QPen(color, 2.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            painter.drawLine(QPointF(cx, cy), QPointF(px, py))
+            direction = math.atan2(py - cy, px - cx)
+            for delta in (-0.42, 0.42):
+                hx = px - math.cos(direction + delta) * 9.0
+                hy = py - math.sin(direction + delta) * 9.0
+                painter.drawLine(QPointF(px, py), QPointF(hx, hy))
+            painter.setPen(color)
+            painter.drawText(
+                QPointF(
+                    px + math.cos(direction) * 11.0,
+                    py + math.sin(direction) * 11.0,
+                ),
+                "XYZ"[index],
+            )
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#6B7A90" if not self._dark else "#B8C5D6"))
+        painter.drawEllipse(QPointF(cx, cy), 3.2, 3.2)
+
+
+class TriAxisCard(QFrame):
+    """显示控件卡片：三轴视图 + X/Y/Z 独立通道绑定。"""
+
+    closed = Signal(object)
+
+    def __init__(self, unit: str = "deg", parent=None):
+        super().__init__(parent)
+        self.setObjectName("displayCard")
+        self.unit = unit
+        self.bindings: list[int | None] = [None, None, None]
+        self._channel_key: tuple | None = None
+        self._last_values = [0.0, 0.0, 0.0]
+        self._has_value = [False, False, False]
+
+        lay = vbox((10, 8, 10, 10), 8)
+        head = hbox(spacing=6)
+        head.addWidget(make_label("三轴坐标系", "displayTitle"))
+        head.addStretch(1)
+        self.close_btn = QToolButton()
+        self.close_btn.setObjectName("displayClose")
+        self.close_btn.setIcon(icon("close", 12, ICON_NEUTRAL))
+        self.close_btn.setToolTip("移除控件")
+        self.close_btn.clicked.connect(lambda _=False: self.closed.emit(self))
+        head.addWidget(self.close_btn)
+        lay.addLayout(head)
+
+        self.axis = TriAxisWidget()
+        lay.addWidget(self.axis, 1)
+
+        self.combos: list[QComboBox] = []
+        self.value_labels: list[QLabel] = []
+        for index, (letter, color) in enumerate(zip("XYZ", AXIS_COLORS)):
+            row = hbox(spacing=6)
+            letter_label = QLabel(letter)
+            letter_label.setObjectName("axisLetter")
+            letter_label.setStyleSheet(f"color: {color};")
+            letter_label.setFixedWidth(14)
+            combo = QComboBox()
+            combo.setObjectName("axisBind")
+            combo.addItem("不绑定", None)
+            combo.currentIndexChanged.connect(
+                lambda _=0, idx=index, box=combo: self._on_bind_changed(idx, box)
+            )
+            value_label = QLabel("--")
+            value_label.setObjectName("axisValue")
+            value_label.setAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            )
+            value_label.setMinimumWidth(62)
+            row.addWidget(letter_label)
+            row.addWidget(combo, 1)
+            row.addWidget(value_label)
+            lay.addLayout(row)
+            self.combos.append(combo)
+            self.value_labels.append(value_label)
+
+        self.setLayout(lay)
+
+    def _on_bind_changed(self, index: int, combo: QComboBox) -> None:
+        self.bindings[index] = combo.currentData()
+        self._refresh_text()
+
+    def set_channels(self, count: int, names: list[str]) -> None:
+        key = (count, tuple(names[:count]))
+        if key == self._channel_key:
+            return
+        self._channel_key = key
+        for index, combo in enumerate(self.combos):
+            current = self.bindings[index]
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("不绑定", None)
+            for channel in range(count):
+                combo.addItem(f"{channel} · {names[channel]}", channel)
+            position = combo.findData(current) if current is not None else 0
+            combo.setCurrentIndex(max(0, position))
+            combo.blockSignals(False)
+            if current is not None and current >= count:
+                self.bindings[index] = None
+
+    def update_data(self, count: int, names: list[str], values: list[float]) -> None:
+        self.set_channels(count, names)
+        for index, binding in enumerate(self.bindings):
+            if binding is not None and binding < count:
+                raw = float(values[binding])
+                self._last_values[index] = raw
+                self._has_value[index] = True
+            else:
+                self._has_value[index] = False
+        self._refresh_axis()
+        self._refresh_text()
+
+    def _refresh_axis(self) -> None:
+        angles = [
+            (
+                math.radians(value)
+                if self.unit == "deg"
+                else value
+            )
+            if self._has_value[index]
+            else 0.0
+            for index, value in enumerate(self._last_values)
+        ]
+        self.axis.set_angles(angles)
+
+    def _refresh_text(self) -> None:
+        for index, label in enumerate(self.value_labels):
+            if not self._has_value[index] or self.bindings[index] is None:
+                label.setText("--")
+                continue
+            value = self._last_values[index]
+            label.setText(
+                f"{value:+.2f}°" if self.unit == "deg" else f"{value:+.4f} rad"
+            )
+
+    def set_unit(self, unit: str) -> None:
+        self.unit = unit
+        self._refresh_axis()
+        self._refresh_text()
+
+    def set_dark(self, dark: bool) -> None:
+        self.axis.set_dark(dark)
+
+
+class DisplayWidgetsPanel(QFrame):
+    """左侧显示控件栏：可添加多个三轴坐标系并独立绑定数据。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("displayPanel")
+        self.setMinimumWidth(220)
+        self.setMaximumWidth(420)
+        self.unit = "deg"
+        self._dark = False
+        self._provider = None
+        self.cards: list[TriAxisCard] = []
+
+        lay = vbox((12, 12, 12, 12), 10)
+        head = hbox(spacing=6)
+        head.addWidget(make_label("显示控件", "titleBlue"))
+        head.addStretch(1)
+
+        self.unit_deg = QPushButton("deg")
+        self.unit_deg.setObjectName("unitBtn")
+        self.unit_deg.setProperty("unitSegment", "first")
+        self.unit_deg.setCheckable(True)
+        self.unit_deg.setChecked(True)
+        self.unit_deg.setFixedSize(36, 24)
+        self.unit_deg.setToolTip("按角度制解释 Rx 数据")
+        self.unit_deg.clicked.connect(lambda _=False: self.set_unit("deg"))
+        head.addWidget(self.unit_deg)
+
+        self.unit_rad = QPushButton("rad")
+        self.unit_rad.setObjectName("unitBtn")
+        self.unit_rad.setProperty("unitSegment", "last")
+        self.unit_rad.setCheckable(True)
+        self.unit_rad.setFixedSize(36, 24)
+        self.unit_rad.setToolTip("按弧度制解释 Rx 数据")
+        self.unit_rad.clicked.connect(lambda _=False: self.set_unit("rad"))
+        head.addWidget(self.unit_rad)
+
+        self.add_btn = QToolButton()
+        self.add_btn.setObjectName("displayAdd")
+        self.add_btn.setIcon(icon("plus", 16, "#2D7EF1"))
+        self.add_btn.setFixedSize(28, 28)
+        self.add_btn.setToolTip("添加显示控件")
+        self.add_btn.clicked.connect(self._show_add_menu)
+        head.addWidget(self.add_btn)
+        lay.addLayout(head)
+
+        self.scroll = QScrollArea()
+        self.scroll.setObjectName("displayScroll")
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        self.list_widget = QWidget()
+        self.list_widget.setObjectName("displayList")
+        self.list_layout = vbox((0, 0, 0, 0), 8)
+        self.empty_hint = make_label(
+            "暂无显示控件\n点击右上角 + 添加三轴坐标系", "tinyMuted"
+        )
+        self.empty_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_hint.setWordWrap(True)
+        self.empty_hint.setContentsMargins(0, 28, 0, 0)
+        self.list_layout.addWidget(self.empty_hint)
+        self.list_layout.addStretch(1)
+        self.list_widget.setLayout(self.list_layout)
+        self.scroll.setWidget(self.list_widget)
+        lay.addWidget(self.scroll, 1)
+        self.setLayout(lay)
+
+    def set_provider(self, provider) -> None:
+        self._provider = provider
+
+    def _show_add_menu(self) -> None:
+        menu = QMenu(self)
+        action = menu.addAction("三轴坐标系")
+        action.triggered.connect(self.add_tri_axis)
+        menu.exec(self.add_btn.mapToGlobal(QPoint(0, self.add_btn.height())))
+
+    def add_tri_axis(self) -> None:
+        card = TriAxisCard(unit=self.unit)
+        card.closed.connect(self.remove_card)
+        card.set_dark(self._dark)
+        self.cards.append(card)
+        self.list_layout.insertWidget(self.list_layout.count() - 1, card)
+        self.empty_hint.hide()
+        self.refresh_from_data()
+        self.scroll.ensureWidgetVisible(card)
+
+    def remove_card(self, card: TriAxisCard) -> None:
+        if card in self.cards:
+            self.cards.remove(card)
+        card.deleteLater()
+        if not self.cards:
+            self.empty_hint.show()
+
+    def refresh_from_data(self) -> None:
+        if self._provider is None or not self.cards:
+            return
+        count, names, values = self._provider()
+        for card in self.cards:
+            card.update_data(count, names, values)
+
+    def set_unit(self, unit: str) -> None:
+        self.unit = "rad" if unit == "rad" else "deg"
+        self.unit_deg.setChecked(self.unit == "deg")
+        self.unit_rad.setChecked(self.unit == "rad")
+        for card in self.cards:
+            card.set_unit(self.unit)
+
+    def set_dark(self, dark: bool) -> None:
+        self._dark = bool(dark)
+        for card in self.cards:
+            card.set_dark(dark)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("VOFA+ Flash 1.0")
+        self.setWindowTitle("VOFA+ Flash 1.1")
         self.setWindowIcon(app_icon())
         self.resize(1480, 900)
         self.setMinimumSize(1280, 760)
@@ -485,6 +849,7 @@ class MainWindow(QMainWindow):
         self.channel_colors = list(CHANNEL_COLORS)
         self.channel_decimals = [3] * MAX_CHANNELS
         self.total_frames = 0
+        self.total_tx = 0
         self.sample_index = 0
         self.dt_ms = 1.0
         self.channel_count = 0
@@ -492,7 +857,10 @@ class MainWindow(QMainWindow):
         self.gains = [1.0] * MAX_CHANNELS
         self.offsets = [0.0] * MAX_CHANNELS
         self.selected_channel = 0
-        self.mouse_adjust = False
+        self.plot_paused = False
+        self.plot_layout_mode = 1
+        self.active_page: PlotPage | None = None
+        self.rx_hex_mode = True
         self.hex_mode = True
         self.filter_rx = False
         self.filter_tx = False
@@ -502,8 +870,10 @@ class MainWindow(QMainWindow):
         self.rx_line_buffer = bytearray()
         self.raw_frame_bytes = bytearray()
         self._last_value_log = 0.0
+        self._last_demo_value_log = 0.0
         self._last_raw_log = 0.0
-        self._log_font_size = 13
+        self._last_rx_hex_log = 0.0
+        self._log_font_size = 16
         self._demo_acc = 0.0
         self.encoding = "utf-8"
         self.serial_bits = 8
@@ -522,6 +892,11 @@ class MainWindow(QMainWindow):
         self._group_colors: dict[str, str] = {}
 
         self.build_ui()
+        self._sync_tx_mode_ui()
+        self._sync_rx_mode_ui()
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
         self.apply_theme(self.dark, remember=False)
         self.refresh_ports()
         self.iface_combo.setCurrentIndex(INTERFACES.index("模拟模式"))
@@ -530,7 +905,7 @@ class MainWindow(QMainWindow):
         self._update_channel_rows()
 
         self.statusBar().showMessage(
-            "就绪 · 已进入模拟模式，点击右上角「模拟模式」运行模拟数据，命令随时可发"
+            "就绪 · 点击「连接」运行数据；空格暂停/继续波形，暂停后移动鼠标查看数值"
         )
 
         self.timer = QTimer(self)
@@ -565,13 +940,17 @@ class MainWindow(QMainWindow):
         body.setChildrenCollapsible(False)
         body.setHandleWidth(4)
         body.addWidget(self.build_rail())
+        self.display_panel = self.build_display_panel()
+        body.addWidget(self.display_panel)
+        self.display_panel.hide()
         self.drawer = self.build_command_drawer()
         body.addWidget(self.drawer)
         body.addWidget(center_right)
-        body.setSizes([48, 300, 1130])
+        body.setSizes([48, 0, 280, 1152])
         body.setStretchFactor(0, 0)
         body.setStretchFactor(1, 0)
-        body.setStretchFactor(2, 1)
+        body.setStretchFactor(2, 0)
+        body.setStretchFactor(3, 1)
         self.body_splitter = body
 
         root_l.addWidget(body, 1)
@@ -588,7 +967,7 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _field(text: str, widget: QWidget) -> QHBoxLayout:
         """顶栏字段：小号灰标签 + 控件，基线对齐。"""
-        row = hbox(spacing=6)
+        row = hbox(spacing=8)
         row.addWidget(make_label(text, "muted"))
         row.addWidget(widget)
         return row
@@ -597,12 +976,12 @@ class MainWindow(QMainWindow):
         top = QFrame()
         top.setObjectName("topbar")
         top.setFixedHeight(64)
-        lay = hbox((14, 0, 12, 0), 10)
+        lay = hbox((14, 0, 10, 0), 10)
 
         # ---- 品牌 + 设置 ----
         brand_row = hbox(spacing=8)
         brand_row.addWidget(make_label("VOFA+ Flash", "brand"))
-        version = make_label("1.0", "versionPill")
+        version = make_label("1.1", "versionPill")
         version.setFixedHeight(20)
         brand_row.addWidget(version, 0, Qt.AlignmentFlag.AlignVCenter)
         self.settings_btn = QToolButton()
@@ -676,7 +1055,7 @@ class MainWindow(QMainWindow):
 
         # ---- 模拟数据：采样率（预设可选，也可双击手输，单位 Hz 放在框外） ----
         demo_page = QWidget()
-        dp = hbox(spacing=4)
+        dp = hbox(spacing=6)
         self.demo_rate_combo = _NumberCombo(
             ["100", "200", "500", "1000", "2000"], "500"
         )
@@ -697,11 +1076,36 @@ class MainWindow(QMainWindow):
         self.link_btn.setObjectName("primary")
         self.link_btn.setFixedWidth(82)
         self.link_btn.setFixedHeight(34)
-        self.link_btn.setToolTip("连接 / 断开；模拟模式下等价于开始 / 暂停模拟数据")
+        self.link_btn.setToolTip("连接 / 断开；模拟模式下控制模拟数据流。空格只暂停波形")
         self.link_btn.clicked.connect(self.toggle_link)
         lay.addWidget(self.link_btn)
 
         lay.addStretch(1)
+
+        self.view2_btn = QToolButton()
+        self.view2_btn.setText("二")
+        self.view2_btn.setObjectName("viewBtn")
+        self.view2_btn.setProperty("viewSegment", "first")
+        self.view2_btn.setCheckable(True)
+        self.view2_btn.setFixedSize(32, 30)
+        self.view2_btn.setToolTip("二窗口显示；再次点击恢复单窗口")
+        self.view2_btn.clicked.connect(
+            lambda: self.set_plot_layout(2 if self.plot_layout_mode != 2 else 1)
+        )
+        lay.addWidget(self.view2_btn)
+
+        self.view3_btn = QToolButton()
+        self.view3_btn.setText("三")
+        self.view3_btn.setObjectName("viewBtn")
+        self.view3_btn.setProperty("viewSegment", "last")
+        self.view3_btn.setCheckable(True)
+        self.view3_btn.setFixedSize(32, 30)
+        self.view3_btn.setToolTip("三窗口显示；再次点击恢复单窗口")
+        self.view3_btn.clicked.connect(
+            lambda: self.set_plot_layout(3 if self.plot_layout_mode != 3 else 1)
+        )
+        lay.addWidget(self.view3_btn)
+        lay.addSpacing(4)
 
         self.mode_tag = QPushButton("● 模拟模式")
         self.mode_tag.setObjectName("primary")
@@ -732,6 +1136,8 @@ class MainWindow(QMainWindow):
             app.setStyleSheet(app_style(dark))
         for page in getattr(self, "pages", []):
             page.set_dark(dark)
+        if hasattr(self, "display_panel"):
+            self.display_panel.set_dark(dark)
         apply_dark_titlebar(self, dark)
         if remember:
             save_dark_setting(dark)
@@ -756,10 +1162,28 @@ class MainWindow(QMainWindow):
         self.btn_cmd.clicked.connect(self.toggle_command_drawer)
         lay.addWidget(self.btn_cmd, 0, Qt.AlignHCenter)
 
+        self.btn_widgets = QPushButton()
+        self.btn_widgets.setObjectName("railBtn")
+        self.btn_widgets.setIcon(icon("cube", 24, "#2D7EF1"))
+        self.btn_widgets.setIconSize(QSize(24, 24))
+        self.btn_widgets.setCheckable(True)
+        self.btn_widgets.setChecked(False)
+        self.btn_widgets.setToolTip("显示控件")
+        self.btn_widgets.clicked.connect(self.toggle_display_panel)
+        lay.addWidget(self.btn_widgets, 0, Qt.AlignHCenter)
+
         lay.addStretch(1)
 
         rail.setLayout(lay)
         return rail
+
+    def build_display_panel(self) -> QWidget:
+        panel = DisplayWidgetsPanel()
+        panel.set_provider(self._display_data)
+        return panel
+
+    def _display_data(self):
+        return self.channel_count, self.channel_names, self.last_values
 
     def build_command_drawer(self) -> QWidget:
         drawer = QFrame()
@@ -819,15 +1243,17 @@ class MainWindow(QMainWindow):
         self.plot_card.setMinimumHeight(240)
         plot_l = vbox((8, 8, 8, 8), 0)
 
-        self.plot_stack = QStackedWidget()
-        self.plot_stack.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        plot_l.addWidget(self.plot_stack, 1)
+        self.plot_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.plot_splitter.setChildrenCollapsible(False)
+        self.plot_splitter.setHandleWidth(4)
+        self.plot_splitter.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        plot_l.addWidget(self.plot_splitter, 1)
 
         self.pages: list[PlotPage] = []
 
         # 信息栏
         self.info_bar = QWidget()
-        info_l = hbox((10, 8, 10, 8), 8)
+        info_l = hbox((10, 12, 10, 8), 8)
         self.dt_spin = QDoubleSpinBox()
         self.dt_spin.setRange(0.01, 10000)
         self.dt_spin.setDecimals(2)
@@ -864,6 +1290,7 @@ class MainWindow(QMainWindow):
 
         self.auto_label = QPushButton("Auto")
         self.auto_label.setObjectName("autoBtn")
+        self.auto_label.setFixedSize(84, 32)
         self.auto_label.setCheckable(True)
         self.auto_label.setChecked(True)
         self.auto_label.setToolTip(
@@ -884,19 +1311,27 @@ class MainWindow(QMainWindow):
         del_btn.clicked.connect(self.clear_plot)
         stat_l.addWidget(del_btn)
 
-        self.rx_count_label = make_label("0", "muted")
+        stat_l.addWidget(make_label("RX", "sectionBlue"))
+        self.rx_count_label = make_label("0", "statValue")
+        stat_l.addWidget(self.rx_count_label)
+        stat_l.addWidget(make_label("/ TX", "muted"))
+        self.tx_count_label = make_label("0", "statTx")
+        stat_l.addWidget(self.tx_count_label)
+        stat_l.addWidget(make_vline(14))
+
+        stat_l.addWidget(make_label("索引", "muted"))
         self.cur_index_label = QLabel("0")
         self.cur_index_label.setStyleSheet(
             "color:#11B6BF;font-family:Consolas;font-size:13px;font-weight:700;"
         )
-        self.scale_label = QLabel("0ms/X-div")
+        stat_l.addWidget(self.cur_index_label)
+        stat_l.addWidget(make_vline(14))
+
+        self.scale_label = QLabel("0ms/格")
+        self.scale_label.setMinimumWidth(82)
         self.scale_label.setStyleSheet(
             "color:#3F86EA;font-family:Consolas;font-size:13px;font-weight:700;"
         )
-        stat_l.addWidget(self.rx_count_label)
-        stat_l.addWidget(make_label("/ 0", "muted"))
-        stat_l.addWidget(make_label("|", "muted"))
-        stat_l.addWidget(self.cur_index_label)
         stat_l.addWidget(self.scale_label)
 
         self.rate_label = QLabel("0 KB/s")
@@ -921,18 +1356,13 @@ class MainWindow(QMainWindow):
         self.img_btn.clicked.connect(self.save_screenshot)
         stat_l.addWidget(self.img_btn)
 
-        self.more_btn = QToolButton()
-        self.more_btn.setObjectName("flatTool")
-        self.more_btn.setIcon(icon("more", 18, ICON_NEUTRAL))
-        self.more_btn.setToolTip("更多")
-        self.more_btn.clicked.connect(self.show_variable_menu)
-        stat_l.addWidget(self.more_btn)
-
         self.stat_bar.setLayout(stat_l)
         plot_l.addWidget(self.stat_bar)
 
         # Auto 按钮就绪后再建波形页，保证页面的 Auto 状态与之同步
-        self._create_page()
+        for _ in range(3):
+            self._create_page()
+        self.set_plot_layout(1, message=False)
 
         self.plot_card.setLayout(plot_l)
 
@@ -956,12 +1386,15 @@ class MainWindow(QMainWindow):
         lay = vbox((10, 8, 10, 8), 8)
 
         tools = hbox(spacing=8)
-        self.btn_ascii = QPushButton("Abc")
-        self.btn_ascii.setObjectName("flatTool")
-        self.btn_ascii.setCheckable(True)
-        self.btn_ascii.setToolTip("文本发送模式")
-        self.btn_ascii.clicked.connect(lambda: self.set_hex_mode(False))
-        tools.addWidget(self.btn_ascii)
+        self.rx_mode_btn = QPushButton("Hex")
+        self.rx_mode_btn.setObjectName("rxModeBtn")
+        self.rx_mode_btn.setCheckable(True)
+        self.rx_mode_btn.setChecked(True)
+        self.rx_mode_btn.setFixedHeight(28)
+        self.rx_mode_btn.setMinimumWidth(54)
+        self.rx_mode_btn.setToolTip("切换接收日志显示：Hex / Abc")
+        self.rx_mode_btn.toggled.connect(self.on_rx_mode_toggled)
+        tools.addWidget(self.rx_mode_btn)
 
         clear_log_btn = QToolButton()
         clear_log_btn.setObjectName("flatTool")
@@ -1005,7 +1438,6 @@ class MainWindow(QMainWindow):
 
         # 这几个文字按钮偏窄时会被 QSS 的内边距吃掉，留出余量，高 DPI 下也不会裁字
         for btn, min_width in (
-            (self.btn_ascii, 46),
             (self.btn_rx, 44),
             (self.btn_tx, 44),
             (self.btn_stamp, 44),
@@ -1047,11 +1479,13 @@ class MainWindow(QMainWindow):
         tools.addWidget(focus_btn)
         lay.addLayout(tools)
 
-        self.rx_text = QPlainTextEdit()
+        self.rx_text = LogTextEdit()
         self.rx_text.setReadOnly(True)
         self.rx_text.setPlaceholderText("这里显示接收日志 / 解析结果 / RawData 十六进制数据……")
         self.rx_text.setMinimumHeight(118)
         self.rx_text.setMaximumBlockCount(4000)
+        self.rx_text.setToolTip("Ctrl + 滚轮调整日志字号")
+        self.rx_text.fontZoomRequested.connect(self.bump_log_font)
         self._apply_log_font()
         lay.addWidget(self.rx_text, 1)
 
@@ -1098,12 +1532,6 @@ class MainWindow(QMainWindow):
         head.addWidget(make_label("◔", "muted"))
         head.addWidget(make_label("数据", "titleBlue"))
         head.addStretch(1)
-        self.right_more = QToolButton()
-        self.right_more.setObjectName("flatTool")
-        self.right_more.setIcon(icon("more", 18, ICON_NEUTRAL))
-        self.right_more.setToolTip("变量与显示设置")
-        self.right_more.clicked.connect(self.show_variable_menu)
-        head.addWidget(self.right_more)
 
         self.right_collapse = QToolButton()
         self.right_collapse.setObjectName("panelBtn")
@@ -1184,21 +1612,46 @@ class MainWindow(QMainWindow):
 
     # ================= 波形页 =================
     def current_page(self) -> PlotPage:
-        widget = self.plot_stack.currentWidget()
-        if isinstance(widget, PlotPage):
-            return widget
+        if self.active_page is not None and self.active_page in self.pages:
+            return self.active_page
         return self.pages[0]
+
+    def _set_active_page(self, page: PlotPage) -> None:
+        if page not in self.pages:
+            return
+        self.active_page = page
+        if hasattr(self, "rx_count_label"):
+            self.update_stats(page)
+
+    def set_plot_layout(self, mode: int, message: bool = True) -> None:
+        mode = max(1, min(3, int(mode)))
+        self.plot_layout_mode = mode
+        height = self.plot_splitter.height() or 600
+        sizes: list[int] = []
+        for i, page in enumerate(self.pages):
+            visible = i == 0 or (i == 1 and mode >= 2) or (i == 2 and mode >= 3)
+            page.setVisible(visible)
+            sizes.append(height // mode if visible else 0)
+        self.plot_splitter.setSizes(sizes)
+        self.view2_btn.setChecked(mode == 2)
+        self.view3_btn.setChecked(mode == 3)
+        if self.active_page is None or not self.active_page.isVisible():
+            self.active_page = self.pages[0]
+        for page in self.pages:
+            if page.isVisible():
+                page.refresh()
+        if message:
+            self.statusBar().showMessage(f"波形窗口：{mode} 窗显示", 2000)
 
     def _create_page(self) -> None:
         page = PlotPage(dark=self.dark)
-        page.set_adjust_mode(self.mouse_adjust)
         page.set_channel_count(self.channel_count)
         page.set_auto_scale(
             self.auto_label.isChecked() if hasattr(self, "auto_label") else True
         )
-        page.gainChanged.connect(self._on_drag_gain)
-        page.offsetChanged.connect(self._on_drag_offset)
+        page.set_inspect_mode(self.plot_paused)
         page.autoScaleRequested.connect(self.auto_label.setChecked)
+        page.activated.connect(self._set_active_page)
         page.contextMenuRequested.connect(
             lambda pos, target=page: self._show_plot_menu_at(target, pos)
         )
@@ -1206,12 +1659,44 @@ class MainWindow(QMainWindow):
             page.set_channel_color(i, self.channel_colors[i])
             page.set_channel_name(i, self.channel_names[i])
         self.pages.append(page)
-        self.plot_stack.addWidget(page)
-        self.plot_stack.setCurrentWidget(page)
+        self.plot_splitter.addWidget(page)
+        if self.active_page is None:
+            self.active_page = page
 
     def _show_plot_menu_at(self, page: PlotPage, global_pos) -> None:
-        """波形区右键菜单：添加变量、变量设置、显示曲线、Auto、导出、清空。"""
+        """波形区右键菜单：模式、FFT、变量、Auto、导出与清空。"""
+        self._set_active_page(page)
         menu = self._build_variable_menu()
+
+        display_menu = QMenu("显示模式", menu)
+        time_act = display_menu.addAction("时域波形")
+        fft_act = display_menu.addAction("频域分析（FFT）")
+        for action, checked in (
+            (time_act, page.plot_mode == "time"),
+            (fft_act, page.plot_mode == "fft"),
+        ):
+            action.setCheckable(True)
+            action.setChecked(checked)
+        time_act.triggered.connect(lambda _=False, p=page: p.set_plot_mode("time"))
+        fft_act.triggered.connect(lambda _=False, p=page: p.set_plot_mode("fft"))
+        menu.addMenu(display_menu)
+
+        window_menu = QMenu("FFT 窗函数", menu)
+        for key, label in FFT_WINDOWS.items():
+            act = window_menu.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(page.fft_settings.get("window") == key)
+            act.triggered.connect(lambda _=False, p=page, k=key: p.set_fft_window(k))
+        menu.addMenu(window_menu)
+
+        scale_menu = QMenu("FFT 纵轴", menu)
+        for key, label in FFT_SCALES.items():
+            act = scale_menu.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(page.fft_settings.get("scale") == key)
+            act.triggered.connect(lambda _=False, p=page, k=key: p.set_fft_scale(k))
+        menu.addMenu(scale_menu)
+
         menu.addSeparator()
         auto_act = menu.addAction("Auto 自动量程")
         auto_act.setCheckable(True)
@@ -1294,10 +1779,6 @@ class MainWindow(QMainWindow):
         row.set_color(color)
         row.eye.setChecked(True)
 
-    def show_variable_menu(self) -> None:
-        pos = self.right_more.mapToGlobal(QPoint(0, self.right_more.height()))
-        self._build_variable_menu().exec(pos)
-
     def _show_variable_menu_at(self, index: int, global_pos) -> None:
         self._select_channel(index)
         self._build_variable_menu(index).exec(global_pos)
@@ -1319,11 +1800,6 @@ class MainWindow(QMainWindow):
         edit_act = menu.addAction("变量设置…", lambda: self.edit_variable(target))
         edit_act.setEnabled(0 <= target < self.channel_count)
 
-        adjust_act = menu.addAction("鼠标调整模式")
-        adjust_act.setCheckable(True)
-        adjust_act.setChecked(self.mouse_adjust)
-        adjust_act.toggled.connect(self.set_mouse_adjust)
-
         menu.addSeparator()
         menu.addAction("导出数据 CSV…", self.export_csv)
         menu.addAction("导出图片 PNG…", self.save_screenshot)
@@ -1338,9 +1814,12 @@ class MainWindow(QMainWindow):
 
     def update_plot(self) -> None:
         page = self.current_page()
-        page.refresh()
+        if not self.plot_paused:
+            page.refresh()
         self.update_stats(page)
         self._refresh_channel_values()
+        if hasattr(self, "display_panel"):
+            self.display_panel.refresh_from_data()
         self._update_throughput()
 
     def _update_throughput(self) -> None:
@@ -1360,10 +1839,11 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "rx_count_label"):
             return
         self.rx_count_label.setText(str(self.total_frames))
+        self.tx_count_label.setText(str(self.total_tx))
         self.cur_index_label.setText(str(self.sample_index))
         span = page.time_span_ms()
         per_div = max(1.0, span / 8.0)
-        self.scale_label.setText(f"{per_div:.0f}ms/X-div")
+        self.scale_label.setText(f"{per_div:.0f}ms/格")
 
     def generate_demo_data(self) -> None:
         rate = self.demo_rate_combo.int_value()
@@ -1417,7 +1897,16 @@ class MainWindow(QMainWindow):
             demo_bytes = len(processed) * 4 + 4
             self._rate_bytes += demo_bytes
             self.bytes_total += demo_bytes
-        if not from_demo and self.engine_name == "JustFloat":
+            # 模拟模式也让日志里有 RX 反馈：每 200ms 一行，不按帧刷屏
+            now = time.monotonic()
+            if now - self._last_demo_value_log >= 0.2:
+                self._last_demo_value_log = now
+                cells = []
+                for i, value in enumerate(processed):
+                    name = self.channel_names[i] if i < len(self.channel_names) else f"I{i}"
+                    cells.append(f"{name}={value:+.3f}")
+                self.log_rx("[模拟RX] " + "  ".join(cells), kind="rx")
+        if not from_demo and not self.rx_hex_mode and self.engine_name == "JustFloat":
             now = time.monotonic()
             if now - self._last_value_log >= 0.15:
                 self._last_value_log = now
@@ -1444,7 +1933,7 @@ class MainWindow(QMainWindow):
                 preview = chunk[:512]
                 suffix = " …" if len(chunk) > len(preview) else ""
                 self.log_rx(
-                    "[raw] " + preview.hex(" ").upper() + suffix, kind="rx"
+                    "[raw] " + self._format_rx_payload(preview) + suffix, kind="rx"
                 )
             self.parse_rawdata(chunk)
             return
@@ -1453,14 +1942,27 @@ class MainWindow(QMainWindow):
             while b"\n" in self.rx_line_buffer:
                 line, _, rest = self.rx_line_buffer.partition(b"\n")
                 self.rx_line_buffer = bytearray(rest)
-                text = line.decode(errors="ignore").strip().replace("\r", "")
+                raw_line = bytes(line)
+                text = raw_line.decode(errors="ignore").strip().replace("\r", "")
                 if not text:
                     continue
                 values = self.parse_ascii_float_line(text)
                 if values:
-                    self.log_rx(text, kind="rx")
+                    if self.rx_hex_mode:
+                        self.log_rx("[rx] " + raw_line.hex(" ").upper(), kind="rx")
+                    else:
+                        self.log_rx(text, kind="rx")
                     self.append_values(values)
         else:
+            if self.rx_hex_mode:
+                now = time.monotonic()
+                if now - self._last_rx_hex_log >= 0.15:
+                    self._last_rx_hex_log = now
+                    preview = chunk[:512]
+                    suffix = " …" if len(chunk) > len(preview) else ""
+                    self.log_rx(
+                        "[rx] " + preview.hex(" ").upper() + suffix, kind="rx"
+                    )
             for frame in self.justfloat.feed(chunk):
                 self.append_values(frame)
 
@@ -1538,6 +2040,15 @@ class MainWindow(QMainWindow):
             del self.log_lines[: len(self.log_lines) - 2000]
         if self._log_visible(kind):
             self._append_log_text(line)
+
+    def _format_rx_payload(self, data: bytes) -> str:
+        if self.rx_hex_mode:
+            return data.hex(" ").upper()
+        return (
+            data.decode(self.encoding, errors="replace")
+            .replace("\r", "")
+            .replace("\n", " ⏎ ")
+        )
 
     def _log_visible(self, kind: str) -> bool:
         if kind == "rx" and self.filter_tx:
@@ -1628,6 +2139,7 @@ class MainWindow(QMainWindow):
         if self.worker is not None:
             self._disconnect()
         self.interface_name = name
+        self.set_plot_paused(False, message=False)
         self._reset_variables(reset_style=True)
         self._sync_param_panel(name)
         if name == "模拟模式":
@@ -1662,6 +2174,12 @@ class MainWindow(QMainWindow):
             self.net_host_edit.setText(host)
             self.net_port_spin.setValue(port)
 
+        # QStackedWidget 默认取所有页里最宽的那个，切换到模拟模式时会留下大片空白。
+        # 只按当前页给宽度，后面的连接按钮就能紧跟着参数。
+        page = self.param_stack.currentWidget()
+        if page is not None:
+            self.param_stack.setFixedWidth(page.sizeHint().width())
+
     def toggle_demo(self) -> None:
         """右上角按钮：只在「模拟模式 / 模拟中」之间切换，始终不显示串口。"""
         if self.interface_name != "模拟模式":
@@ -1678,10 +2196,28 @@ class MainWindow(QMainWindow):
             self.btn_cmd.setChecked(False)
         else:
             self.drawer.setVisible(True)
-            width = getattr(self, "_drawer_width", 300)
-            total = max(self.body_splitter.width(), 48 + width + 400)
-            self.body_splitter.setSizes([48, width, total - 48 - width])
+            width = getattr(self, "_drawer_width", 280)
+            display_width = self.display_panel.width() if self.display_panel.isVisible() else 0
+            total = max(self.body_splitter.width(), 48 + display_width + width + 400)
+            self.body_splitter.setSizes(
+                [48, display_width, width, total - 48 - display_width - width]
+            )
             self.btn_cmd.setChecked(True)
+
+    def toggle_display_panel(self) -> None:
+        if self.display_panel.isVisible():
+            self._display_width = max(220, self.display_panel.width())
+            self.display_panel.setVisible(False)
+            self.btn_widgets.setChecked(False)
+        else:
+            self.display_panel.setVisible(True)
+            width = getattr(self, "_display_width", 235)
+            drawer_width = self.drawer.width() if self.drawer.isVisible() else 0
+            total = max(self.body_splitter.width(), 48 + width + drawer_width + 400)
+            self.body_splitter.setSizes(
+                [48, width, drawer_width, total - 48 - width - drawer_width]
+            )
+            self.btn_widgets.setChecked(True)
 
     # ================= 串口 / 网络连接 =================
     def _build_serial_fmt_menu(self) -> None:
@@ -1760,25 +2296,27 @@ class MainWindow(QMainWindow):
         self._connect()
 
     def _toggle_demo_stream(self) -> None:
-        """模拟模式：连接按钮控制模拟数据流启停，发送命令不受影响。"""
+        """模拟模式：连接按钮控制模拟数据流连接 / 断开，断开后可移动鼠标看波形数值。"""
         self.demo_enabled = not self.demo_enabled
         self._set_link_state(self.demo_enabled)
+        self.set_plot_paused(not self.demo_enabled, message=False)
         if self.demo_enabled:
             self.mode_tag.setText("● 模拟中")
             self.mode_tag.setObjectName("green")
-            self.statusBar().showMessage("模拟模式运行中，可发送命令", 3000)
+            self.statusBar().showMessage("模拟数据流已连接，可发送命令", 3000)
         else:
             self.mode_tag.setText("● 模拟模式")
             self.mode_tag.setObjectName("primary")
             self._reset_variables(reset_style=True)
-            self.statusBar().showMessage("模拟模式数据流已暂停，仍可发送命令", 3000)
+            self.statusBar().showMessage(
+                "模拟数据流已断开：移动鼠标查看数值，按空格恢复波形刷新", 4000
+            )
         self.mode_tag.style().polish(self.mode_tag)
 
     def _set_link_state(self, connected: bool) -> None:
         self.connected = bool(connected)
-        demo = self.interface_name == "模拟模式"
         if connected:
-            self.link_btn.setText("暂停" if demo else "断开")
+            self.link_btn.setText("断开")
             self.link_btn.setObjectName("danger")
         else:
             self.link_btn.setText("连接")
@@ -1876,17 +2414,53 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "接口错误", message)
         self._disconnect()
 
-    # ================= 发送 =================
+    # ================= 发送 / 接收显示 =================
+    def _sync_tx_mode_ui(self) -> None:
+        self._syncing_tx_mode = True
+        self.tx_mode_btn.setChecked(self.hex_mode)
+        self.tx_mode_btn.setText("Hex" if self.hex_mode else "Abc")
+        self._syncing_tx_mode = False
+
     def on_tx_mode_toggled(self, checked: bool) -> None:
-        self.hex_mode = checked
-        self.tx_mode_btn.setText("Hex" if checked else "Ascii")
-        self.btn_ascii.setChecked(not checked)
-        self.statusBar().showMessage(
-            "发送格式：Hex" if checked else "发送格式：文本(Abc)", 2000
-        )
+        if getattr(self, "_syncing_tx_mode", False):
+            return
+        self.set_hex_mode(checked)
 
     def set_hex_mode(self, enabled: bool) -> None:
-        self.tx_mode_btn.setChecked(enabled)
+        enabled = bool(enabled)
+        changed = enabled != self.hex_mode
+        self.hex_mode = enabled
+        self._sync_tx_mode_ui()
+        if changed:
+            self.statusBar().showMessage(
+                "发送格式：Hex" if enabled else "发送格式：文本(Abc)", 2000
+            )
+
+    def _sync_rx_mode_ui(self) -> None:
+        self._syncing_rx_mode = True
+        self.rx_mode_btn.setChecked(self.rx_hex_mode)
+        self.rx_mode_btn.setText("Hex" if self.rx_hex_mode else "Abc")
+        self.rx_mode_btn.setToolTip(
+            "接收显示：Hex（点击切换为 Abc）"
+            if self.rx_hex_mode
+            else "接收显示：Abc（点击切换为 Hex）"
+        )
+        self._syncing_rx_mode = False
+
+    def on_rx_mode_toggled(self, checked: bool) -> None:
+        if getattr(self, "_syncing_rx_mode", False):
+            return
+        self.set_rx_hex_mode(checked)
+
+    def set_rx_hex_mode(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        changed = enabled != self.rx_hex_mode
+        self.rx_hex_mode = enabled
+        self._sync_rx_mode_ui()
+        if changed:
+            self.statusBar().showMessage(
+                "接收显示：Hex 原始字节" if enabled else "接收显示：Abc 文本", 2000
+            )
 
     def set_encoding(self, label: str, codec: str) -> None:
         self.encoding = codec
@@ -1929,6 +2503,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 f"模拟模式已发出 {len(payload)} 字节（仅回显，接串口后真实下发）", 3000
             )
+        self._mark_tx_sent()
 
     def send_payload(self, payload: bytes) -> None:
         """直接发送已组好的字节帧（命令面板使用）。"""
@@ -1946,10 +2521,17 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 f"模拟模式已发出 {len(payload)} 字节（仅回显，接串口后真实下发）", 2000
             )
+        self._mark_tx_sent()
+
+    def _mark_tx_sent(self) -> None:
+        self.total_tx += 1
+        if hasattr(self, "tx_count_label"):
+            self.update_stats(self.current_page())
 
     # ================= 波形 / 通道 =================
     def clear_plot(self) -> None:
         self.total_frames = 0
+        self.total_tx = 0
         self.sample_index = 0
         self.raw_frame_bytes.clear()
         self.rx_line_buffer.clear()
@@ -2031,42 +2613,48 @@ class MainWindow(QMainWindow):
         for row in self.channel_rows:
             row.set_selected(row.index == index and index < self.channel_count)
 
-    def set_mouse_adjust(self, enabled: bool) -> None:
-        self.mouse_adjust = bool(enabled)
+    def set_plot_paused(self, paused: bool, message: bool = True) -> None:
+        paused = bool(paused)
+        if self.plot_paused == paused:
+            return
+        self.plot_paused = paused
         for page in self.pages:
-            page.set_adjust_mode(self.mouse_adjust)
-        self.statusBar().showMessage(
-            "鼠标调整已开启：上下拖改增益，左右拖改偏置"
-            if self.mouse_adjust
-            else "鼠标调整已关闭",
-            2500,
-        )
+            page.set_inspect_mode(paused)
+        if message:
+            self.statusBar().showMessage(
+                "波形已暂停：移动鼠标查看数值，按空格继续"
+                if paused
+                else "波形已继续",
+                4000 if paused else 2000,
+            )
 
-    def toggle_mouse_adjust(self) -> None:
-        self.set_mouse_adjust(not self.mouse_adjust)
+    def toggle_plot_pause(self) -> None:
+        self.set_plot_paused(not self.plot_paused)
+
+    @staticmethod
+    def _is_text_input(widget) -> bool:
+        return isinstance(
+            widget, (QLineEdit, QPlainTextEdit, QTextEdit, QAbstractSpinBox)
+        ) or (isinstance(widget, QComboBox) and widget.isEditable())
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        if (
+            event.type() == QEvent.Type.KeyPress
+            and event.key() == Qt.Key_Space
+            and not event.modifiers() & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier)
+            and not self._is_text_input(obj)
+            and QApplication.activePopupWidget() is None
+        ):
+            modal = QApplication.activeModalWidget()
+            if modal is None or modal is self:
+                self.toggle_plot_pause()
+                return True
+        return super().eventFilter(obj, event)
 
     def _target_channel(self) -> int:
         if self.channel_count == 0:
             return -1
         return min(self.selected_channel, self.channel_count - 1)
-
-    def _on_drag_gain(self, delta: int) -> None:
-        index = self._target_channel()
-        if index < 0:
-            return
-        self.gains[index] = round(self.gains[index] + delta * 0.05, 4)
-        self.statusBar().showMessage(
-            f"{self.channel_names[index]} 增益 {self.gains[index]:.2f}", 1200
-        )
-
-    def _on_drag_offset(self, delta: int) -> None:
-        index = self._target_channel()
-        if index < 0:
-            return
-        self.offsets[index] = round(self.offsets[index] + delta * 0.05, 4)
-        self.statusBar().showMessage(
-            f"{self.channel_names[index]} 偏置 {self.offsets[index]:.2f}", 1200
-        )
 
     def _format_value(self, value: float, index: int = 0) -> str:
         digits = (
@@ -2384,6 +2972,9 @@ def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName("VOFA+ Flash")
     app.setWindowIcon(app_icon())
+    base_font = QFont("Microsoft YaHei UI")
+    base_font.setPointSize(9)
+    app.setFont(base_font)
     app.setStyleSheet(app_style(load_dark_setting()))
     window = MainWindow()
     window.show()

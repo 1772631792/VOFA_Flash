@@ -6,10 +6,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
+
+from vofa import __version__ as VERSION
 
 ROOT = Path(__file__).resolve().parent
 APP_NAME = "VOFA_Flash"
@@ -18,6 +22,8 @@ ASSETS = ROOT / "assets"
 ICON = ASSETS / "app.ico"
 DIST = ROOT / "dist"
 WORK = ROOT / "build"
+VERSION_FILE = WORK / "version_info.txt"
+RELEASE_ZIP = DIST / f"{APP_NAME}_v{VERSION}_win64.zip"
 
 # 运行期动态导入 / 按名称加载的模块，PyInstaller 静态分析看不到
 HIDDEN_IMPORTS = [
@@ -34,7 +40,67 @@ EXCLUDES = [
     "scipy",
     "IPython",
     "pytest",
+    "OpenGL",
+    "pyqtgraph.opengl",
 ]
+
+
+def write_version_file() -> None:
+    """写入 Windows exe 文件属性：版本、产品名、版权。"""
+    parts = [int(part) for part in VERSION.split(".") if part.isdigit()]
+    parts = (parts + [0, 0, 0, 0])[:4]
+    version_tuple = tuple(parts)
+    WORK.mkdir(parents=True, exist_ok=True)
+    VERSION_FILE.write_text(
+        f"""VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers={version_tuple},
+    prodvers={version_tuple},
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo([
+      StringTable('040904B0', [
+        StringStruct('CompanyName', 'VOFA+ Flash'),
+        StringStruct('FileDescription', 'VOFA+ Flash serial waveform debugger'),
+        StringStruct('FileVersion', '{VERSION}'),
+        StringStruct('InternalName', '{APP_NAME}'),
+        StringStruct('OriginalFilename', '{APP_NAME}.exe'),
+        StringStruct('ProductName', 'VOFA+ Flash'),
+        StringStruct('ProductVersion', '{VERSION}')
+      ])
+    ]),
+    VarFileInfo([VarStruct('Translation', [1033, 1200])])
+  ]
+)
+""",
+        encoding="utf-8",
+    )
+
+
+def package_release(exe: Path) -> tuple[Path, str]:
+    """生成发布 zip，并返回 (zip 路径, sha256)。"""
+    RELEASE_ZIP.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(RELEASE_ZIP, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.write(exe, arcname=exe.name)
+        readme = ROOT / "README.md"
+        if readme.exists():
+            archive.write(readme, arcname="README.md")
+        screenshots = ROOT / "docs" / "screenshots"
+        if screenshots.is_dir():
+            for image in sorted(screenshots.glob("*.png")):
+                archive.write(image, arcname=f"docs/screenshots/{image.name}")
+
+    digest = hashlib.sha256(exe.read_bytes()).hexdigest()
+    (DIST / f"{APP_NAME}_v{VERSION}_sha256.txt").write_text(
+        f"{digest}  {exe.name}\n", encoding="utf-8"
+    )
+    return RELEASE_ZIP, digest
 
 
 def build_command() -> list[str]:
@@ -63,6 +129,8 @@ def build_command() -> list[str]:
         cmd += ["--add-data", f"{ASSETS}{os.pathsep}assets"]
     if ICON.exists():
         cmd += ["--icon", str(ICON)]
+    if VERSION_FILE.exists():
+        cmd += ["--version-file", str(VERSION_FILE)]
     cmd.append(str(ENTRY))
     return cmd
 
@@ -78,7 +146,8 @@ def main() -> None:
         print(f"找不到入口文件: {ENTRY}")
         sys.exit(1)
 
-    print(f"开始打包 {APP_NAME}.exe ...")
+    write_version_file()
+    print(f"开始打包 {APP_NAME}.exe（v{VERSION}）...")
     subprocess.run(build_command(), cwd=ROOT, check=True)
 
     exe = DIST / f"{APP_NAME}.exe"
@@ -86,7 +155,10 @@ def main() -> None:
         print("打包结束但未找到产物，请检查 PyInstaller 输出。")
         sys.exit(1)
     size_mb = exe.stat().st_size / (1024 * 1024)
+    release_zip, digest = package_release(exe)
     print(f"\n完成：{exe}（{size_mb:.1f} MB）")
+    print(f"发布包：{release_zip}")
+    print(f"SHA256：{digest}")
     print("双击即可运行，串口驱动由系统提供，无需额外安装 Python。")
 
 

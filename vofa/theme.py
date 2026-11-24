@@ -81,10 +81,82 @@ QFrame#railRight {
     background: #eef2f7;
     border-left: 1px solid #e2e8f0;
 }
-QFrame#drawer, QFrame#rightbar, QFrame#plotCard, QFrame#bottomCard, QFrame#infoCard {
+QFrame#drawer, QFrame#rightbar, QFrame#plotCard, QFrame#bottomCard, QFrame#infoCard, QFrame#displayPanel {
     background: #ffffff;
     border: 1px solid #e6ebf2;
     border-radius: 10px;
+}
+QFrame#displayCard {
+    background: #f7f9fc;
+    border: 1px solid #e6ebf2;
+    border-radius: 10px;
+}
+QLabel#displayTitle {
+    color: #24374a;
+    font-size: 13px;
+    font-weight: 700;
+}
+QToolButton#displayAdd {
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 7px;
+    padding: 0px;
+}
+QToolButton#displayAdd:hover {
+    background: #e8f1ff;
+    border-color: #cfe0f8;
+}
+QToolButton#displayClose {
+    background: transparent;
+    border: 0px;
+    padding: 0px;
+}
+QToolButton#displayClose:hover {
+    background: #fdf3f5;
+    border-radius: 6px;
+}
+QPushButton#unitBtn {
+    background: #eef2f7;
+    border: 1px solid #dde5ef;
+    border-radius: 7px;
+    color: #4b6078;
+    font-family: Consolas, "Microsoft YaHei UI";
+    font-size: 12px;
+    font-weight: 700;
+    padding: 0px;
+}
+QPushButton#unitBtn[unitSegment="first"] {
+    border-top-right-radius: 0px;
+    border-bottom-right-radius: 0px;
+}
+QPushButton#unitBtn[unitSegment="last"] {
+    border-top-left-radius: 0px;
+    border-bottom-left-radius: 0px;
+    border-left: 0px;
+}
+QPushButton#unitBtn:hover {
+    background: #edf4ff;
+    border-color: #9fc3ff;
+    color: #1f67c7;
+}
+QPushButton#unitBtn:checked {
+    background: #2d7ef1;
+    border-color: #2d7ef1;
+    color: #fdfdfd;
+}
+QComboBox#axisBind {
+    min-height: 26px;
+    padding: 1px 6px;
+    font-size: 12px;
+}
+QLabel#axisValue {
+    color: #4b6078;
+    font-family: Consolas, "Microsoft YaHei UI";
+    font-size: 12px;
+}
+QScrollArea#displayScroll, QWidget#displayList {
+    background: transparent;
+    border: 0px;
 }
 QFrame#rightbar {
     border-radius: 0px;
@@ -193,6 +265,26 @@ QPushButton#hexMode:checked {
     border-color: #9fc3ff;
     font-weight: 700;
 }
+QPushButton#rxModeBtn {
+    background: #eef2f7;
+    border: 1px solid #dde5ef;
+    border-radius: 8px;
+    padding: 5px 12px;
+    color: #4b6078;
+    font-family: "Microsoft YaHei UI";
+    font-size: 13px;
+    font-weight: 700;
+}
+QPushButton#rxModeBtn:hover {
+    background: #edf4ff;
+    border-color: #9fc3ff;
+    color: #1f67c7;
+}
+QPushButton#rxModeBtn:checked {
+    background: #2d7ef1;
+    border-color: #2d7ef1;
+    color: #fdfdfd;
+}
 QToolButton#addCmd {
     background: transparent;
     border: 0px;
@@ -258,7 +350,16 @@ QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QLineEdit:focus {
 }
 QComboBox::drop-down {
     border: 0px;
-    width: 20px;
+    width: 18px;
+}
+QComboBox::down-arrow {
+    image: none;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 5px solid #7b8798;
+    width: 0px;
+    height: 0px;
+    margin-right: 5px;
 }
 QComboBox:hover, QSpinBox:hover, QDoubleSpinBox:hover, QLineEdit:hover {
     border-color: #9fc3ff;
@@ -381,6 +482,18 @@ QSlider::handle:horizontal:hover {
 QSlider::handle:horizontal:disabled {
     border-color: #c3cedd;
 }
+QLabel#statValue {
+    color: #24374a;
+    font-family: Consolas, "Microsoft YaHei UI";
+    font-size: 13px;
+    font-weight: 800;
+}
+QLabel#statTx {
+    color: #7b8798;
+    font-family: Consolas, "Microsoft YaHei UI";
+    font-size: 13px;
+    font-weight: 700;
+}
 QLabel#emptyHint {
     color: #aab6c6;
     font-size: 12px;
@@ -451,14 +564,14 @@ QToolButton#iconBtn:checked {
     border-color: #cfe0f8;
 }
 QPushButton#autoBtn {
-    font-size: 17px;
+    font-size: 18px;
     font-style: italic;
     font-weight: 800;
     color: #9aa8b8;
     background: transparent;
     border: 1px solid transparent;
-    border-radius: 7px;
-    padding: 2px 12px;
+    border-radius: 8px;
+    padding: 2px 4px;
 }
 QPushButton#autoBtn:hover {
     color: #1f67c7;
@@ -468,6 +581,36 @@ QPushButton#autoBtn:checked {
     color: #1f67c7;
     background: #e8f1ff;
     border-color: #cfe0f8;
+}
+QToolButton#viewBtn {
+    min-width: 0px;
+    background: #eef2f7;
+    border: 1px solid #dde5ef;
+    border-radius: 8px;
+    color: #4b6078;
+    font-family: "Microsoft YaHei UI";
+    font-size: 13px;
+    font-weight: 800;
+    padding: 0px;
+}
+QToolButton#viewBtn[viewSegment="first"] {
+    border-top-right-radius: 0;
+    border-bottom-right-radius: 0;
+}
+QToolButton#viewBtn[viewSegment="last"] {
+    border-top-left-radius: 0;
+    border-bottom-left-radius: 0;
+    border-left: 0;
+}
+QToolButton#viewBtn:hover {
+    background: #edf4ff;
+    border-color: #9fc3ff;
+    color: #1f67c7;
+}
+QToolButton#viewBtn:checked {
+    background: #2d7ef1;
+    border-color: #2d7ef1;
+    color: #fdfdfd;
 }
 QToolButton#themeCard {
     background: #ffffff;
