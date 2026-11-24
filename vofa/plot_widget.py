@@ -148,9 +148,6 @@ PLOT_THEMES = {
         "readout_bg": "rgba(255, 255, 255, 244)",
         "readout_border": "#E2E9F2",
         "readout_text": "#4A5B70",
-        "pause_bg": "rgba(236, 245, 255, 246)",
-        "pause_border": "#BBD5F6",
-        "pause_text": "#2B6CB0",
     },
     "dark": {
         "bg": "#1E1E1E",
@@ -165,9 +162,6 @@ PLOT_THEMES = {
         "readout_bg": "rgba(37, 37, 38, 246)",
         "readout_border": "#3C3C3C",
         "readout_text": "#D4D4D4",
-        "pause_bg": "rgba(28, 38, 52, 246)",
-        "pause_border": "#2E4A6B",
-        "pause_text": "#9FC3FF",
     },
 }
 
@@ -288,15 +282,7 @@ class PlotPage(pg.PlotWidget):
         self._readout.setStyleSheet(self._readout_qss(pal))
         self._readout.hide()
 
-        self._pause_badge = QLabel(self.viewport())
-        self._pause_badge.setAttribute(
-            Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
-        )
-        self._pause_badge.setText("已暂停 · 按空格继续")
-        self._pause_badge.setStyleSheet(self._pause_badge_qss(pal))
-        self._pause_badge.adjustSize()
-        self._pause_badge.move(10, 8)
-        self._pause_badge.hide()
+        # 暂停提示不画在画布内：由主窗口统一放在波形卡片外（统计栏），避免遮挡曲线
 
         # ---- 数据 ----
         self.channel_count = 0
@@ -339,21 +325,6 @@ class PlotPage(pg.PlotWidget):
             "}"
         )
 
-    @staticmethod
-    def _pause_badge_qss(pal: dict) -> str:
-        return (
-            "QLabel {"
-            f" background: {pal['pause_bg']};"
-            f" border: 1px solid {pal['pause_border']};"
-            " border-radius: 12px;"
-            " padding: 5px 10px;"
-            f" color: {pal['pause_text']};"
-            " font-family: Consolas, 'Microsoft YaHei UI';"
-            " font-size: 12px;"
-            " font-weight: 700;"
-            "}"
-        )
-
     def is_dark(self) -> bool:
         return self._dark
 
@@ -387,7 +358,6 @@ class PlotPage(pg.PlotWidget):
         self._vline.setPen(cursor_pen)
         self._hline.setPen(cursor_pen)
         self._readout.setStyleSheet(self._readout_qss(pal))
-        self._pause_badge.setStyleSheet(self._pause_badge_qss(pal))
         self.update()
 
     # ---------- 数据 ----------
@@ -460,14 +430,10 @@ class PlotPage(pg.PlotWidget):
             self._legend_key = None
 
     def set_inspect_mode(self, enabled: bool) -> None:
-        """暂停时显示暂停徽标；十字游标读数始终可用。"""
+        """暂停时进入查看模式（暂停提示由主窗口在波形卡片外展示）；读数始终可用。"""
         self.inspect_mode = bool(enabled)
         if self.inspect_mode:
-            self._pause_badge.show()
-            self._pause_badge.raise_()
             self._readout.raise_()
-        else:
-            self._pause_badge.hide()
 
     # ---------- 时域 / FFT ----------
     def _fft_y_label(self) -> str:
@@ -777,12 +743,6 @@ class PlotPage(pg.PlotWidget):
         self._vline.setVisible(False)
         self._hline.setVisible(False)
 
-    def _place_pause_badge(self) -> None:
-        if hasattr(self, "_pause_badge"):
-            self._pause_badge.move(10, 8)
-            self._pause_badge.raise_()
-            self._readout.raise_()
-
     # ---------- 事件 ----------
     def resizeEvent(self, ev) -> None:
         super().resizeEvent(ev)
@@ -790,7 +750,6 @@ class PlotPage(pg.PlotWidget):
             return  # 基类 __init__ 期间就会触发一次 resizeEvent
         self._place_watermark()
         self._hide_cursor_readout()
-        self._place_pause_badge()
 
     def mousePressEvent(self, ev) -> None:
         self.activated.emit(self)

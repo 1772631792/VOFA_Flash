@@ -498,6 +498,16 @@ QLabel#emptyHint {
     color: #aab6c6;
     font-size: 12px;
 }
+QLabel#pauseBadge {
+    color: #1f67c7;
+    background: #e8f1ff;
+    border: 1px solid #cfe0f8;
+    border-radius: 11px;
+    padding: 3px 12px;
+    font-family: Consolas, "Microsoft YaHei UI";
+    font-size: 12px;
+    font-weight: 800;
+}
 QSpinBox::up-button, QSpinBox::down-button,
 QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
     width: 0px;

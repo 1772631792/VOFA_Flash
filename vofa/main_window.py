@@ -1342,6 +1342,14 @@ class MainWindow(QMainWindow):
         stat_l.addWidget(self.rate_label)
         stat_l.addStretch(1)
 
+        # 暂停提示放在统计栏空白处（波形画布之外），不遮挡曲线
+        self.pause_badge = QLabel("已暂停 · 按空格继续")
+        self.pause_badge.setObjectName("pauseBadge")
+        self.pause_badge.setToolTip("波形已暂停，移动鼠标查看数值；按空格继续")
+        self.pause_badge.setVisible(False)
+        stat_l.addWidget(self.pause_badge, 0, Qt.AlignmentFlag.AlignVCenter)
+        stat_l.addSpacing(8)
+
         self.csv_btn = QToolButton()
         self.csv_btn.setObjectName("flatTool")
         self.csv_btn.setIcon(icon("docs", 18, ICON_NEUTRAL))
@@ -2620,6 +2628,8 @@ class MainWindow(QMainWindow):
         self.plot_paused = paused
         for page in self.pages:
             page.set_inspect_mode(paused)
+        if hasattr(self, "pause_badge"):
+            self.pause_badge.setVisible(paused)
         if message:
             self.statusBar().showMessage(
                 "波形已暂停：移动鼠标查看数值，按空格继续"
