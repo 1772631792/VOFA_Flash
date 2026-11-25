@@ -1,17 +1,39 @@
-"""VOFA+ Flash 1.1 外观复刻：波形主界面（参考 vofa_demo 布局）。"""
+"""VOFA+ Flash 波形主界面：外观参考 vofa_demo 布局。"""
 
 from __future__ import annotations
 
 import csv
+import json
 import math
 import re
 import struct
 import sys
 import time
+from typing import TYPE_CHECKING
 
 import serial.tools.list_ports
-from PySide6.QtCore import QEvent, QPoint, QPointF, QSettings, QSize, Qt, QTimer, Signal, Slot
-from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtCore import (
+    QByteArray,
+    QEvent,
+    QPoint,
+    QPointF,
+    QSettings,
+    QSize,
+    Qt,
+    QTimer,
+    Signal,
+    Slot,
+)
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QIcon,
+    QKeySequence,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
@@ -20,8 +42,10 @@ from PySide6.QtWidgets import (
     QDialog,
     QDoubleSpinBox,
     QFileDialog,
+    QFormLayout,
     QFrame,
     QHBoxLayout,
+    QKeySequenceEdit,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -34,12 +58,14 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QSplitter,
     QStackedWidget,
+    QTabWidget,
     QTextEdit,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
+from . import __version__ as VERSION
 from .command_panel import CommandDialog, CommandItem, parse_frame_bytes
 from .icons import app_icon, icon
 from .plot_widget import FFT_SCALES, FFT_WINDOWS, MAX_CHANNELS, PlotPage
@@ -53,6 +79,9 @@ from .transport import (
     UdpTransport,
 )
 
+if TYPE_CHECKING:
+    from .splash import SplashScreen
+
 ENGINES = ["JustFloat", "RawData"]
 INTERFACES = ["串口", "UDP", "TCP客户端", "TCP服务端", "模拟模式"]
 
@@ -60,6 +89,20 @@ SETTINGS_ORG = "VOFAFlash"
 SETTINGS_APP = "VOFAFlash"
 ICON_NEUTRAL = "#7C8CA0"
 DEMO_CHANNELS = 3  # 模拟模式的通道数：JustFloat 本身不限通道，不占用顶栏
+SHORTCUT_DEFAULTS = {
+    "pause": "Space",
+    "connect": "F5",
+    "screenshot": "Ctrl+S",
+    "export_csv": "Ctrl+E",
+    "clear_plot": "Ctrl+L",
+}
+SHORTCUT_LABELS = {
+    "pause": "暂停 / 继续波形",
+    "connect": "连接 / 断开",
+    "screenshot": "导出截图 PNG",
+    "export_csv": "导出数据 CSV",
+    "clear_plot": "清空波形",
+}
 
 
 def load_dark_setting() -> bool:
@@ -69,6 +112,17 @@ def load_dark_setting() -> bool:
 
 def save_dark_setting(dark: bool) -> None:
     QSettings(SETTINGS_ORG, SETTINGS_APP).setValue("appearance/dark", bool(dark))
+
+
+def load_setting(key: str, default, value_type=None):
+    settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+    if value_type is None:
+        return settings.value(key, default)
+    return settings.value(key, default, type=value_type)
+
+
+def save_setting(key: str, value) -> None:
+    QSettings(SETTINGS_ORG, SETTINGS_APP).setValue(key, value)
 
 
 def apply_dark_titlebar(window: QWidget, dark: bool) -> bool:
@@ -383,22 +437,88 @@ class _ThemeCard(QToolButton):
         return pix
 
 
+class _JsonDropArea(QFrame):
+    """设置里的空白投放区：点击选文件，或直接把 .json 拖进来。"""
+
+    clicked = Signal()
+    fileDropped = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("jsonDrop")
+        self.setAcceptDrops(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setMinimumHeight(92)
+        self.setStyleSheet(
+            "#jsonDrop {"
+            " border: 2px dashed #B9CCE3;"
+            " border-radius: 10px;"
+            " background: rgba(240,247,255,160);"
+            "}"
+            "#jsonDrop QLabel { color: #5C7189; }"
+        )
+        lay = vbox((8, 8, 8, 8), 2)
+        title = make_label("点击导入布局 JSON", "sectionBlue", Qt.AlignmentFlag.AlignHCenter)
+        hint = make_label("或把 .json 文件直接拖到这里", "tinyMuted", Qt.AlignmentFlag.AlignHCenter)
+        lay.addWidget(title)
+        lay.addWidget(hint)
+        self.setLayout(lay)
+        for label in (title, hint):
+            label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802
+        urls = event.mimeData().urls()
+        if urls and urls[0].toLocalFile().lower().endswith(".json"):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event) -> None:  # noqa: N802
+        for url in event.mimeData().urls():
+            path = url.toLocalFile()
+            if path.lower().endswith(".json"):
+                self.fileDropped.emit(path)
+                event.acceptProposedAction()
+                return
+
+
 class SettingsDialog(QDialog):
-    """设置：外观（浅色 / 深色立即生效）与语言（位置预留）。"""
+    """设置：外观、快捷键、布局 JSON 导出 / 导入。"""
 
     themeChanged = Signal(bool)
+    shortcutsChanged = Signal(dict)
 
-    def __init__(self, dark: bool, parent=None):
+    def __init__(self, window: "MainWindow", parent=None):
         super().__init__(parent)
+        self._window = window
         self.setWindowTitle("设置")
-        self.setMinimumWidth(470)
+        self.setMinimumSize(520, 500)
+        self._shortcut_edits: dict[str, QKeySequenceEdit] = {}
 
-        lay = vbox((22, 18, 22, 16), 12)
-        lay.addWidget(make_label("设置", "sectionBlue"))
-        lay.addWidget(make_label("外观与语言", "tinyMuted"))
-        lay.addWidget(make_hr())
+        root = vbox((18, 14, 18, 14), 10)
+        root.addWidget(make_label("设置", "sectionBlue"))
+        tabs = QTabWidget()
+        tabs.addTab(self._appearance_tab(window.dark), "外观")
+        tabs.addTab(self._shortcut_tab(window), "快捷键")
+        tabs.addTab(self._layout_tab(), "布局")
+        root.addWidget(tabs, 1)
 
-        lay.addWidget(make_label("外观", "sectionBlue"))
+        buttons = hbox(spacing=8)
+        buttons.addStretch(1)
+        done_btn = QPushButton("完成")
+        done_btn.setObjectName("primary")
+        done_btn.setFixedWidth(88)
+        done_btn.clicked.connect(self._on_done)
+        buttons.addWidget(done_btn)
+        root.addLayout(buttons)
+        self.setLayout(root)
+
+    def _appearance_tab(self, dark: bool) -> QWidget:
+        page = QWidget()
+        lay = vbox((18, 18, 18, 14), 12)
         cards = hbox(spacing=14)
         self.light_card = _ThemeCard("浅色", "#F1F4F9", "#FFFFFF", "#2D7EF1")
         self.dark_card = _ThemeCard("深色", "#1E1E1E", "#252526", "#0E7ACC")
@@ -406,6 +526,7 @@ class SettingsDialog(QDialog):
         self.dark_card.setChecked(dark)
         cards.addWidget(self.light_card, 1)
         cards.addWidget(self.dark_card, 1)
+        lay.addWidget(make_label("外观", "sectionBlue"))
         lay.addLayout(cards)
 
         lay.addWidget(make_label("语言", "sectionBlue"))
@@ -417,25 +538,111 @@ class SettingsDialog(QDialog):
             item.setEnabled(False)
         lay.addWidget(self.lang_combo)
         lay.addWidget(make_label("语言切换入口已预留，后续版本开放。", "tinyMuted"))
-
         lay.addStretch(1)
-        buttons = hbox(spacing=8)
-        buttons.addStretch(1)
-        done_btn = QPushButton("完成")
-        done_btn.setObjectName("primary")
-        done_btn.setFixedWidth(88)
-        done_btn.clicked.connect(self.accept)
-        buttons.addWidget(done_btn)
-        lay.addLayout(buttons)
-        self.setLayout(lay)
+        page.setLayout(lay)
 
         self.light_card.clicked.connect(lambda: self._choose(False))
         self.dark_card.clicked.connect(lambda: self._choose(True))
+        return page
+
+    def _shortcut_tab(self, window: "MainWindow") -> QWidget:
+        page = QWidget()
+        form = QFormLayout(page)
+        form.setContentsMargins(18, 18, 18, 14)
+        form.setSpacing(10)
+        form.addRow(make_label("点击输入框后直接按组合键", "tinyMuted"))
+        for key, label in SHORTCUT_LABELS.items():
+            edit = QKeySequenceEdit(window.shortcuts.get(key, QKeySequence()), page)
+            self._shortcut_edits[key] = edit
+            form.addRow(label, edit)
+        reset_btn = QPushButton("恢复默认快捷键")
+        reset_btn.clicked.connect(self._reset_shortcuts)
+        form.addRow("", reset_btn)
+        return page
+
+    def _layout_tab(self) -> QWidget:
+        page = QWidget()
+        lay = vbox((18, 18, 18, 14), 10)
+        lay.addWidget(make_label("布局配置", "sectionBlue"))
+        lay.addWidget(
+            make_label("导出当前窗口布局为 JSON，下次可导入恢复。", "tinyMuted")
+        )
+        buttons = hbox(spacing=8)
+        export_btn = QPushButton("导出当前布局…")
+        export_btn.clicked.connect(self._export_layout_dialog)
+        import_btn = QPushButton("导入布局…")
+        import_btn.clicked.connect(self._import_layout_dialog)
+        buttons.addWidget(export_btn)
+        buttons.addWidget(import_btn)
+        buttons.addStretch(1)
+        lay.addLayout(buttons)
+
+        drop = _JsonDropArea()
+        drop.clicked.connect(self._import_layout_dialog)
+        drop.fileDropped.connect(self._import_layout_path)
+        lay.addWidget(drop, 1)
+        self.layout_hint = make_label("", "tinyMuted")
+        lay.addWidget(self.layout_hint)
+        page.setLayout(lay)
+        return page
 
     def _choose(self, dark: bool) -> None:
         self.light_card.setChecked(not dark)
         self.dark_card.setChecked(dark)
         self.themeChanged.emit(dark)
+
+    def _reset_shortcuts(self) -> None:
+        for key, text in SHORTCUT_DEFAULTS.items():
+            edit = self._shortcut_edits.get(key)
+            if edit is not None:
+                edit.setKeySequence(QKeySequence(text))
+
+    def _collect_shortcuts(self) -> dict[str, str] | None:
+        mapping: dict[str, str] = {}
+        used: dict[str, str] = {}
+        for key, edit in self._shortcut_edits.items():
+            sequence = edit.keySequence()
+            if sequence.isEmpty():
+                continue
+            text = sequence.toString()
+            if text in used:
+                QMessageBox.warning(
+                    self,
+                    "快捷键冲突",
+                    f"「{SHORTCUT_LABELS[key]}」与「{SHORTCUT_LABELS[used[text]]}」"
+                    f"都使用了 {text}，请修改其中一个。",
+                )
+                return None
+            used[text] = key
+            mapping[key] = text
+        return mapping
+
+    def _on_done(self) -> None:
+        mapping = self._collect_shortcuts()
+        if mapping is None:
+            return
+        self.shortcutsChanged.emit(mapping)
+        self.accept()
+
+    def _export_layout_dialog(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出当前布局", "vofa_flash_layout.json", "JSON 文件 (*.json)"
+        )
+        if not path:
+            return
+        self._window.export_layout(path)
+        self.layout_hint.setText(f"已导出：{path}")
+
+    def _import_layout_dialog(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "导入布局 JSON", "", "JSON 文件 (*.json)"
+        )
+        if path:
+            self._import_layout_path(path)
+
+    def _import_layout_path(self, path: str) -> None:
+        self._window.import_layout(path)
+        self.layout_hint.setText(f"已导入：{path}")
 
 
 class _NumberCombo(QComboBox):
@@ -833,8 +1040,9 @@ class DisplayWidgetsPanel(QFrame):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("VOFA+ Flash 1.1")
-        self.setWindowIcon(app_icon())
+        self.setWindowTitle(f"VOFA+ Flash {VERSION}")
+        self._app_icon = app_icon()
+        self.setWindowIcon(self._app_icon)
         self.resize(1480, 900)
         self.setMinimumSize(1280, 760)
 
@@ -880,6 +1088,13 @@ class MainWindow(QMainWindow):
         self.serial_parity = "None"
         self.serial_stopbits = 1
         self.serial_flow = "None"
+        self.auto_reconnect = bool(load_setting("serial/auto_reconnect", True, bool))
+        self._last_serial_port = str(load_setting("serial/last_port", "", str))
+        self._last_serial_baud = str(load_setting("serial/last_baud", "115200", str))
+        self._manual_disconnect = False
+        self._reconnect_armed = False
+        self._auto_connecting = False
+        self.shortcuts = self._load_shortcuts()
         self.bytes_total = 0
         self._rate_bytes = 0
         self._rate_frames = 0
@@ -896,6 +1111,7 @@ class MainWindow(QMainWindow):
             app.installEventFilter(self)
         self.apply_theme(self.dark, remember=False)
         self.refresh_ports()
+        self._restore_serial_selection()
         self.iface_combo.setCurrentIndex(INTERFACES.index("模拟模式"))
         self.on_iface_changed("模拟模式")
         self._select_channel(0)
@@ -912,6 +1128,10 @@ class MainWindow(QMainWindow):
         self.port_timer = QTimer(self)
         self.port_timer.timeout.connect(lambda: self.refresh_ports(silent=True))
         self.port_timer.start(3000)
+
+        self.reconnect_timer = QTimer(self)
+        self.reconnect_timer.setSingleShot(True)
+        self.reconnect_timer.timeout.connect(self._auto_reconnect_attempt)
 
     # ================= UI =================
     def build_ui(self) -> None:
@@ -978,7 +1198,7 @@ class MainWindow(QMainWindow):
         # ---- 品牌 + 设置 ----
         brand_row = hbox(spacing=8)
         brand_row.addWidget(make_label("VOFA+ Flash", "brand"))
-        version = make_label("1.1", "versionPill")
+        version = make_label(VERSION, "versionPill")
         version.setFixedHeight(20)
         brand_row.addWidget(version, 0, Qt.AlignmentFlag.AlignVCenter)
         self.settings_btn = QToolButton()
@@ -1119,9 +1339,28 @@ class MainWindow(QMainWindow):
 
     # ================= 设置 / 主题 =================
     def open_settings(self) -> None:
-        dialog = SettingsDialog(self.dark, self)
+        dialog = SettingsDialog(self)
         dialog.themeChanged.connect(self.apply_theme)
+        dialog.shortcutsChanged.connect(self.apply_shortcuts)
         dialog.exec()
+
+    @staticmethod
+    def _load_shortcuts() -> dict[str, QKeySequence]:
+        result: dict[str, QKeySequence] = {}
+        for key, default in SHORTCUT_DEFAULTS.items():
+            text = str(load_setting(f"shortcuts/{key}", default, str))
+            sequence = QKeySequence(text)
+            result[key] = sequence if not sequence.isEmpty() else QKeySequence(default)
+        return result
+
+    def apply_shortcuts(self, mapping: dict[str, str]) -> None:
+        for key, text in mapping.items():
+            sequence = QKeySequence(text)
+            if sequence.isEmpty() or key not in SHORTCUT_DEFAULTS:
+                continue
+            self.shortcuts[key] = sequence
+            save_setting(f"shortcuts/{key}", text)
+        self.statusBar().showMessage("快捷键已更新", 2500)
 
     def apply_theme(self, dark: bool, remember: bool = True) -> None:
         """浅色 / 深色切换：全局样式表、波形页与状态栏提示一起更新。"""
@@ -1339,6 +1578,15 @@ class MainWindow(QMainWindow):
         stat_l.addWidget(self.rate_label)
         stat_l.addStretch(1)
 
+        # 差分读数放在统计栏（画布之外），避免浮在曲线上遮挡数据
+        self.diff_label = make_label("A/B 差分：未开启", "statValue")
+        self.diff_label.setToolTip(
+            "右键波形 → 差分测量 A/B：开启后依次点击波形设置 A、B，差值显示在这里"
+        )
+        self.diff_label.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+        stat_l.addWidget(self.diff_label, 0, Qt.AlignmentFlag.AlignVCenter)
+        stat_l.addSpacing(8)
+
         # 暂停提示放在统计栏空白处（波形画布之外），不遮挡曲线
         self.pause_badge = QLabel("已暂停 · 按空格继续")
         self.pause_badge.setObjectName("pauseBadge")
@@ -1346,6 +1594,13 @@ class MainWindow(QMainWindow):
         self.pause_badge.setVisible(False)
         stat_l.addWidget(self.pause_badge, 0, Qt.AlignmentFlag.AlignVCenter)
         stat_l.addSpacing(8)
+
+        self.replay_btn = QToolButton()
+        self.replay_btn.setObjectName("flatTool")
+        self.replay_btn.setIcon(icon("rewind", 18, ICON_NEUTRAL))
+        self.replay_btn.setToolTip("导入 CSV 回放曲线")
+        self.replay_btn.clicked.connect(self.import_csv_replay)
+        stat_l.addWidget(self.replay_btn)
 
         self.csv_btn = QToolButton()
         self.csv_btn.setObjectName("flatTool")
@@ -1657,6 +1912,7 @@ class MainWindow(QMainWindow):
         page.set_inspect_mode(self.plot_paused)
         page.autoScaleRequested.connect(self.auto_label.setChecked)
         page.activated.connect(self._set_active_page)
+        page.diffMeasured.connect(self._show_diff_readout)
         page.contextMenuRequested.connect(
             lambda pos, target=page: self._show_plot_menu_at(target, pos)
         )
@@ -1701,6 +1957,14 @@ class MainWindow(QMainWindow):
             act.setChecked(page.fft_settings.get("scale") == key)
             act.triggered.connect(lambda _=False, p=page, k=key: p.set_fft_scale(k))
         menu.addMenu(scale_menu)
+
+        diff_act = menu.addAction("差分测量 A/B")
+        diff_act.setCheckable(True)
+        diff_act.setChecked(page.diff_mode)
+        diff_act.setToolTip("开启后依次左键点击波形设置 A、B；差值显示在统计栏，不遮挡曲线")
+        diff_act.toggled.connect(
+            lambda on=False, target=page: target.set_diff_mode(on)
+        )
 
         menu.addSeparator()
         auto_act = menu.addAction("Auto 自动量程")
@@ -1806,10 +2070,33 @@ class MainWindow(QMainWindow):
         edit_act.setEnabled(0 <= target < self.channel_count)
 
         menu.addSeparator()
+        menu.addAction("导入 CSV 回放…", self.import_csv_replay)
         menu.addAction("导出数据 CSV…", self.export_csv)
         menu.addAction("导出图片 PNG…", self.save_screenshot)
         menu.addAction("清空波形", self.clear_plot)
         return menu
+
+    def _show_diff_readout(self, info: dict) -> None:
+        """差分读数只更新统计栏，绝不往波形画布上贴浮层。"""
+        if not hasattr(self, "diff_label"):
+            return
+        if not info or not info.get("active"):
+            self.diff_label.setText("差分：未开启")
+            return
+        a = info.get("a")
+        b = info.get("b")
+        if a is None or b is None:
+            self.diff_label.setText(
+                "差分：点击波形设置 B" if a is not None else "差分：点击波形设置 A"
+            )
+            return
+        dt = float(info.get("dt_ms", 0.0))
+        parts = [f"Δt {dt:+.1f}ms"]
+        for name, delta in zip(info.get("names", []), info.get("dvalues", [])):
+            parts.append(f"Δ{name} {delta:+.4g}")
+        text = "  ".join(parts)
+        self.diff_label.setText(text)
+        self.diff_label.setToolTip(text.replace("  ", "\n"))
 
     # ================= 数据源 =================
     def on_tick(self) -> None:
@@ -2141,7 +2428,10 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"数据引擎切换为 {name}", 3000)
 
     def on_iface_changed(self, name: str) -> None:
-        if self.worker is not None:
+        if self.worker is not None or self.connected:
+            self._manual_disconnect = True
+            self._reconnect_armed = False
+            self.reconnect_timer.stop()
             self._disconnect()
         self.interface_name = name
         self.set_plot_paused(False, message=False)
@@ -2245,7 +2535,21 @@ class MainWindow(QMainWindow):
                     lambda _=False, a=attr, o=option: self._set_serial_param(a, o)
                 )
         menu.addSeparator()
+        reconnect_act = menu.addAction("串口自动重连")
+        reconnect_act.setCheckable(True)
+        reconnect_act.setChecked(self.auto_reconnect)
+        reconnect_act.setToolTip("端口意外断开后自动重连上次端口（手动断开不会重连）")
+        reconnect_act.toggled.connect(self._set_auto_reconnect)
         menu.addAction("恢复默认 8N1", self._reset_serial_fmt)
+
+    def _set_auto_reconnect(self, enabled: bool) -> None:
+        self.auto_reconnect = bool(enabled)
+        save_setting("serial/auto_reconnect", self.auto_reconnect)
+        if not self.auto_reconnect:
+            self.reconnect_timer.stop()
+        self.statusBar().showMessage(
+            "串口自动重连已开启" if enabled else "串口自动重连已关闭", 2000
+        )
 
     def _set_serial_param(self, attr: str, value) -> None:
         setattr(self, attr, value)
@@ -2272,6 +2576,57 @@ class MainWindow(QMainWindow):
         self.serial_fmt_btn.setText(text)
         self.statusBar().showMessage(f"串口格式：{text}", 3000)
 
+    @staticmethod
+    def _real_ports() -> list[str]:
+        """只返回真实存在的串口，不使用 refresh_ports 的演示占位端口。"""
+        try:
+            return [p.device for p in serial.tools.list_ports.comports()]
+        except Exception:
+            return []
+
+    def _restore_serial_selection(self) -> None:
+        if self._last_serial_baud:
+            self.baud_combo.setCurrentText(self._last_serial_baud)
+        ports = self._real_ports()
+        if self._last_serial_port and self._last_serial_port in ports:
+            self.port_combo.setCurrentText(self._last_serial_port)
+
+    def _should_auto_reconnect(self) -> bool:
+        return (
+            self.auto_reconnect
+            and self.interface_name == "串口"
+            and self._reconnect_armed
+            and not self._manual_disconnect
+            and self.worker is None
+            and not self.connected
+        )
+
+    def _schedule_reconnect(self) -> None:
+        if self.reconnect_timer.isActive() or not self._should_auto_reconnect():
+            return
+        self.mode_tag.setText("● 等待重连")
+        self.mode_tag.setObjectName("primary")
+        self.mode_tag.style().polish(self.mode_tag)
+        self.statusBar().showMessage("串口已断开，1.5 秒后自动重连…", 3000)
+        self.reconnect_timer.start(1500)
+
+    def _auto_reconnect_attempt(self) -> None:
+        if not self._should_auto_reconnect():
+            self.reconnect_timer.stop()
+            return
+        port = self._last_serial_port or self.port_combo.currentText().strip()
+        if not port or port not in self._real_ports():
+            # 设备还没插回来：保持定时检查，不弹窗打扰
+            self.reconnect_timer.start(1500)
+            return
+        self.port_combo.setCurrentText(port)
+        if self._last_serial_baud:
+            self.baud_combo.setCurrentText(self._last_serial_baud)
+        self._manual_disconnect = False
+        self._auto_connecting = True
+        self.statusBar().showMessage(f"正在自动重连 {port} …", 2000)
+        self._connect()
+
     def refresh_ports(self, silent: bool = False) -> None:
         """刷新串口列表；silent 为定时自动刷新，不打断下拉与状态栏。"""
         if silent and self.port_combo.view().isVisible():
@@ -2295,9 +2650,15 @@ class MainWindow(QMainWindow):
             self._toggle_demo_stream()
             return
         if self.worker is not None or self.connected:
+            self._manual_disconnect = True
+            self._reconnect_armed = False
+            self.reconnect_timer.stop()
             self._disconnect()
             self.statusBar().showMessage("已断开连接", 3000)
             return
+        self._manual_disconnect = False
+        self._reconnect_armed = True
+        self.reconnect_timer.stop()
         self._connect()
 
     def _toggle_demo_stream(self) -> None:
@@ -2331,17 +2692,20 @@ class MainWindow(QMainWindow):
         self.link_btn.style().polish(self.link_btn)
 
     def _connect(self) -> None:
+        self.reconnect_timer.stop()
         name = self.interface_name
         worker: SerialWorker | BaseTransport
         if name == "串口":
             port = self.port_combo.currentText().strip()
             if not port:
-                QMessageBox.warning(self, "参数错误", "请选择串口端口")
+                if not self._auto_connecting:
+                    QMessageBox.warning(self, "参数错误", "请选择串口端口")
                 return
             try:
                 baud = int(self.baud_combo.currentText().strip())
             except ValueError:
-                QMessageBox.warning(self, "参数错误", "波特率必须是整数")
+                if not self._auto_connecting:
+                    QMessageBox.warning(self, "参数错误", "波特率必须是整数")
                 return
             worker = SerialWorker(
                 port,
@@ -2389,9 +2753,21 @@ class MainWindow(QMainWindow):
     def on_connected(self) -> None:
         self._set_link_state(True)
         self.demo_enabled = False
+        self._auto_connecting = False
+        self._manual_disconnect = False
+        self._reconnect_armed = True
         self.justfloat.reset()
         self.rx_line_buffer.clear()
         self.raw_frame_bytes.clear()
+        if self.interface_name == "串口":
+            port = self.port_combo.currentText().strip()
+            baud = self.baud_combo.currentText().strip()
+            if port:
+                self._last_serial_port = port
+                save_setting("serial/last_port", port)
+            if baud:
+                self._last_serial_baud = baud
+                save_setting("serial/last_baud", baud)
         self.mode_tag.setText("● 已连接")
         self.mode_tag.setObjectName("primary")
         self.mode_tag.style().polish(self.mode_tag)
@@ -2400,6 +2776,9 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def on_disconnected(self) -> None:
+        if self.sender() is self.worker and self.worker is not None:
+            # 后台线程主动掉线：清掉失效 worker，才能进入自动重连流程
+            self.worker = None
         self._set_link_state(False)
         if self.interface_name == "模拟模式":
             running = self.demo_enabled
@@ -2412,11 +2791,16 @@ class MainWindow(QMainWindow):
         self.mode_tag.style().polish(self.mode_tag)
         self._reset_variables(reset_style=True)
         self.statusBar().showMessage("已断开连接", 3000)
+        self._auto_connecting = False
+        if self._should_auto_reconnect():
+            self._schedule_reconnect()
 
     @Slot(str)
     def on_error(self, message: str) -> None:
+        auto_retry = self._auto_connecting
         self.log_rx(f"[error] {message}", kind="tx")
-        QMessageBox.warning(self, "接口错误", message)
+        if not auto_retry:
+            QMessageBox.warning(self, "接口错误", message)
         self._disconnect()
 
     # ================= 发送 / 接收显示 =================
@@ -2587,6 +2971,247 @@ class MainWindow(QMainWindow):
             return
         self.statusBar().showMessage(f"已导出 {len(times)} 行数据：{path}", 4000)
 
+    def import_csv_replay(self, path: str | bool | None = None) -> None:
+        """把本程序导出的 CSV（time_ms + 各通道）重新画成波形。"""
+        if not isinstance(path, str):
+            path, _ = QFileDialog.getOpenFileName(
+                self, "导入 CSV 回放", "waveform.csv", "CSV 文件 (*.csv)"
+            )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8-sig", newline="") as fh:
+                rows = [row for row in csv.reader(fh) if row and any(c.strip() for c in row)]
+        except (OSError, UnicodeError, csv.Error) as exc:
+            QMessageBox.warning(self, "导入失败", str(exc))
+            return
+        if not rows:
+            QMessageBox.information(self, "没有数据", "CSV 文件是空的")
+            return
+
+        header = [cell.strip() for cell in rows[0]]
+        data_rows = rows
+        names: list[str] = []
+        if header and header[0].lower() in ("time_ms", "time", "t", "时间", "时间/ms"):
+            names = [name or f"I{i}" for i, name in enumerate(header[1 : MAX_CHANNELS + 1])]
+            data_rows = rows[1:]
+
+        parsed: list[tuple[float, list[float]]] = []
+        for row in data_rows:
+            try:
+                t_ms = float(row[0])
+            except (ValueError, IndexError):
+                continue
+            values: list[float] = []
+            for cell in row[1 : MAX_CHANNELS + 1]:
+                try:
+                    values.append(float(cell))
+                except ValueError:
+                    values.append(0.0)
+            while len(values) < MAX_CHANNELS:
+                values.append(values[-1] if values else 0.0)
+            parsed.append((t_ms, values[:MAX_CHANNELS]))
+        if not parsed:
+            QMessageBox.information(self, "没有数据", "CSV 中没有可回放的数值行")
+            return
+
+        # 回放时暂停真实数据源，避免新数据混进历史曲线；也不触发自动重连
+        self.demo_enabled = False
+        self._manual_disconnect = True
+        self._reconnect_armed = False
+        self.reconnect_timer.stop()
+        if self.worker is not None or self.connected:
+            self._disconnect()
+
+        data_columns = max((len(row) - 1 for row in data_rows), default=0)
+        count = max(1, min(max(len(names), data_columns), MAX_CHANNELS))
+        self.channel_count = count
+        for i, name in enumerate(names[:MAX_CHANNELS]):
+            self.channel_names[i] = name
+        self._update_channel_rows()
+        for page in self.pages:
+            page.set_channel_count(0)
+            page.clear_data()
+            page.set_channel_count(count)
+            for i in range(MAX_CHANNELS):
+                page.set_channel_name(i, self.channel_names[i])
+                page.set_channel_color(i, self.channel_colors[i])
+
+        self.total_frames = 0
+        self.sample_index = 0
+        self.set_plot_paused(False, message=False)
+        for t_ms, values in parsed:
+            for page in self.pages:
+                page.append_sample(values, t_ms=t_ms)
+            self.total_frames += 1
+            self.sample_index += 1
+            self.last_values[:count] = values[:count]
+        self._refresh_channel_values()
+        self.update_plot()
+        self.statusBar().showMessage(f"已回放 {len(parsed)} 行数据：{path}", 4000)
+
+    def export_layout(self, path: str | bool | None = None) -> None:
+        """把当前布局导出为 JSON，便于下次一键恢复。"""
+        if not isinstance(path, str):
+            path, _ = QFileDialog.getSaveFileName(
+                self, "导出当前布局", "vofa_flash_layout.json", "JSON 文件 (*.json)"
+            )
+        if not path:
+            return
+        channels = {
+            "count": self.channel_count,
+            "names": list(self.channel_names[:MAX_CHANNELS]),
+            "colors": list(self.channel_colors[:MAX_CHANNELS]),
+            "gains": list(self.gains[:MAX_CHANNELS]),
+            "offsets": list(self.offsets[:MAX_CHANNELS]),
+            "decimals": list(self.channel_decimals[:MAX_CHANNELS]),
+            "visible": [
+                self.channel_rows[i].eye.isChecked() for i in range(MAX_CHANNELS)
+            ],
+        }
+        payload = {
+            "format": "vofa-flash-layout",
+            "version": 1,
+            "window": {"geometry": bytes(self.saveGeometry()).hex()},
+            "appearance": {"dark": self.dark},
+            "plot": {
+                "layout": self.plot_layout_mode,
+                "auto_scale": self.auto_label.isChecked(),
+                "dt_ms": self.dt_spin.value(),
+                "buffer": self.buffer_spin.value(),
+                "align": self.align_spin.value(),
+                "splitter": list(self.plot_splitter.sizes()),
+            },
+            "panels": {
+                "body": list(self.body_splitter.sizes()),
+                "center": list(self.center_splitter.sizes()),
+                "vertical": list(self.center_vsplit.sizes()),
+                "display_visible": self.display_panel.isVisible(),
+                "drawer_visible": self.drawer.isVisible(),
+                "data_collapsed": self._data_collapsed,
+            },
+            "channels": channels,
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False, indent=2)
+        except OSError as exc:
+            QMessageBox.warning(self, "导出失败", str(exc))
+            return
+        self.statusBar().showMessage(f"布局已导出：{path}", 4000)
+
+    def import_layout(self, path: str | bool | None = None) -> None:
+        """导入布局 JSON：窗口位置、面板宽度、显示模式与变量样式一起恢复。"""
+        if not isinstance(path, str):
+            path, _ = QFileDialog.getOpenFileName(
+                self, "导入布局 JSON", "", "JSON 文件 (*.json)"
+            )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8-sig") as fh:
+                data = json.load(fh)
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            QMessageBox.warning(self, "导入失败", str(exc))
+            return
+        if not isinstance(data, dict) or data.get("format") != "vofa-flash-layout":
+            QMessageBox.warning(self, "导入失败", "不是 VOFA+ Flash 布局 JSON 文件")
+            return
+
+        def pick(items, index: int, default):
+            if isinstance(items, list) and index < len(items):
+                return items[index]
+            return default
+
+        try:
+            geometry_hex = str(data.get("window", {}).get("geometry", ""))
+            if geometry_hex:
+                self.restoreGeometry(QByteArray.fromHex(geometry_hex.encode("ascii")))
+
+            dark = bool(data.get("appearance", {}).get("dark", self.dark))
+            if dark != self.dark:
+                self.apply_theme(dark)
+
+            plot = data.get("plot", {})
+            for spin, key, cast in (
+                (self.dt_spin, "dt_ms", float),
+                (self.buffer_spin, "buffer", int),
+                (self.align_spin, "align", int),
+            ):
+                spin.blockSignals(True)
+                try:
+                    spin.setValue(cast(plot.get(key, spin.value())))
+                finally:
+                    spin.blockSignals(False)
+            self.dt_ms = float(self.dt_spin.value())
+            for page in self.pages:
+                page.set_dt(self.dt_ms)
+                page.set_buffer_limit(int(self.buffer_spin.value()))
+                page.set_display_points(int(self.align_spin.value()))
+
+            channels = data.get("channels", {})
+            count = max(0, min(int(channels.get("count", self.channel_count)), MAX_CHANNELS))
+            self.channel_count = count
+            for i in range(MAX_CHANNELS):
+                self.channel_names[i] = str(pick(channels.get("names"), i, self.channel_names[i]))
+                self.channel_colors[i] = str(pick(channels.get("colors"), i, self.channel_colors[i]))
+                try:
+                    self.gains[i] = float(pick(channels.get("gains"), i, self.gains[i]))
+                    self.offsets[i] = float(pick(channels.get("offsets"), i, self.offsets[i]))
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    self.channel_decimals[i] = int(
+                        pick(channels.get("decimals"), i, self.channel_decimals[i])
+                    )
+                except (TypeError, ValueError):
+                    pass
+            visible = [bool(value) for value in channels.get("visible", [])]
+            self._update_channel_rows()
+            for page in self.pages:
+                page.set_channel_count(count)
+                for i in range(MAX_CHANNELS):
+                    page.set_channel_color(i, self.channel_colors[i])
+                    page.set_channel_name(i, self.channel_names[i])
+                    page.set_visible(i, visible[i] if i < len(visible) else True)
+            for i, row in enumerate(self.channel_rows):
+                if i < count:
+                    row.eye.setChecked(visible[i] if i < len(visible) else True)
+
+            panels = data.get("panels", {})
+            self.set_data_panel_collapsed(
+                bool(panels.get("data_collapsed", self._data_collapsed))
+            )
+            show_display = bool(panels.get("display_visible", self.display_panel.isVisible()))
+            self.display_panel.setVisible(show_display)
+            self.btn_widgets.setChecked(show_display)
+            show_drawer = bool(panels.get("drawer_visible", self.drawer.isVisible()))
+            self.drawer.setVisible(show_drawer)
+            self.btn_cmd.setChecked(show_drawer)
+
+            self.set_plot_layout(int(plot.get("layout", self.plot_layout_mode)), message=False)
+            auto_scale = bool(plot.get("auto_scale", True))
+            self.auto_label.setChecked(auto_scale)
+            for page in self.pages:
+                page.set_auto_scale(auto_scale)
+                page.refresh()
+
+            def apply_sizes(splitter, sizes) -> None:
+                if not isinstance(sizes, list) or len(sizes) != len(splitter.sizes()):
+                    return
+                splitter.setSizes([max(0, int(value)) for value in sizes])
+
+            apply_sizes(self.body_splitter, panels.get("body"))
+            apply_sizes(self.center_splitter, panels.get("center"))
+            apply_sizes(self.center_vsplit, panels.get("vertical"))
+            apply_sizes(self.plot_splitter, plot.get("splitter"))
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            QMessageBox.warning(self, "导入失败", f"布局文件无法解析：{exc}")
+            return
+
+        self.update_plot()
+        self.statusBar().showMessage(f"布局已恢复：{path}", 4000)
+
     def on_dt_changed(self, value: float) -> None:
         self.dt_ms = float(value)
         for page in self.pages:
@@ -2647,15 +3272,30 @@ class MainWindow(QMainWindow):
     def eventFilter(self, obj, event) -> bool:  # noqa: N802
         if (
             event.type() == QEvent.Type.KeyPress
-            and event.key() == Qt.Key_Space
-            and not event.modifiers() & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier)
             and not self._is_text_input(obj)
             and QApplication.activePopupWidget() is None
         ):
             modal = QApplication.activeModalWidget()
             if modal is None or modal is self:
-                self.toggle_plot_pause()
-                return True
+                modifiers = event.modifiers()
+                mods_value = modifiers.value if hasattr(modifiers, "value") else int(modifiers)
+                key = event.key()
+                key_value = key.value if hasattr(key, "value") else int(key)
+                pressed = QKeySequence(mods_value | key_value)
+                for action, sequence in self.shortcuts.items():
+                    if sequence.isEmpty() or pressed != sequence:
+                        continue
+                    if action == "pause":
+                        self.toggle_plot_pause()
+                    elif action == "connect":
+                        self.toggle_link()
+                    elif action == "screenshot":
+                        self.save_screenshot()
+                    elif action == "export_csv":
+                        self.export_csv()
+                    elif action == "clear_plot":
+                        self.clear_plot()
+                    return True
         return super().eventFilter(obj, event)
 
     def _target_channel(self) -> int:
@@ -2999,10 +3639,15 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
-def main() -> None:
-    import sys
-
-    app = QApplication(sys.argv)
+def main(
+    app: QApplication | None = None,
+    splash: "SplashScreen | None" = None,
+    run_loop: bool = True,
+) -> None:
+    """启动主窗口；splash 由轻量入口创建并传入，构造完成后淡出。"""
+    own_app = app is None
+    if own_app:
+        app = QApplication(sys.argv)
     app.setApplicationName("VOFA+ Flash")
     app.setWindowIcon(app_icon())
     base_font = QFont("Microsoft YaHei UI")
@@ -3011,4 +3656,7 @@ def main() -> None:
     app.setStyleSheet(app_style(load_dark_setting()))
     window = MainWindow()
     window.show()
-    sys.exit(app.exec())
+    if splash is not None:
+        splash.finish(window)
+    if own_app or run_loop:
+        sys.exit(app.exec())

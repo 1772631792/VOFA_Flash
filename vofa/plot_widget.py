@@ -145,6 +145,8 @@ PLOT_THEMES = {
         "watermark": (160, 186, 220, 34),
         "hint": (150, 168, 190, 190),
         "cursor": (96, 140, 196, 120),
+        "diff_a": (245, 165, 36, 230),
+        "diff_b": (123, 97, 255, 230),
         "readout_bg": "rgba(255, 255, 255, 244)",
         "readout_border": "#E2E9F2",
         "readout_text": "#4A5B70",
@@ -159,6 +161,8 @@ PLOT_THEMES = {
         "watermark": (255, 255, 255, 14),
         "hint": (140, 140, 140, 190),
         "cursor": (120, 170, 255, 120),
+        "diff_a": (255, 183, 77, 230),
+        "diff_b": (167, 139, 250, 230),
         "readout_bg": "rgba(37, 37, 38, 246)",
         "readout_border": "#3C3C3C",
         "readout_text": "#D4D4D4",
@@ -174,6 +178,7 @@ class PlotPage(pg.PlotWidget):
     contextMenuRequested = Signal(object)
     autoScaleRequested = Signal(bool)
     activated = Signal(object)
+    diffMeasured = Signal(object)
 
     def __init__(self, parent=None, dark: bool = False):
         pal = PLOT_THEMES["dark" if dark else "light"]
@@ -274,6 +279,25 @@ class PlotPage(pg.PlotWidget):
             line.setVisible(False)
             plot.addItem(line, ignoreBounds=True)
 
+        # ---- 差分游标 A / B ----
+        self._diff_a_line = pg.InfiniteLine(
+            angle=90,
+            movable=False,
+            pen=pg.mkPen(pal["diff_a"], width=1.5),
+        )
+        self._diff_b_line = pg.InfiniteLine(
+            angle=90,
+            movable=False,
+            pen=pg.mkPen(pal["diff_b"], width=1.5, style=Qt.PenStyle.DashLine),
+        )
+        for line in (self._diff_a_line, self._diff_b_line):
+            line.setZValue(41)
+            line.setVisible(False)
+            plot.addItem(line, ignoreBounds=True)
+        self.diff_mode = False
+        self._diff_times: list[float | None] = [None, None]
+        self._x_base_ms = 0.0
+
         self._readout = QLabel(self.viewport())
         self._readout.setAttribute(
             Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
@@ -357,12 +381,18 @@ class PlotPage(pg.PlotWidget):
         cursor_pen = pg.mkPen(pal["cursor"], width=1, style=Qt.PenStyle.DashLine)
         self._vline.setPen(cursor_pen)
         self._hline.setPen(cursor_pen)
+        self._diff_a_line.setPen(pg.mkPen(pal["diff_a"], width=1.5))
+        self._diff_b_line.setPen(
+            pg.mkPen(pal["diff_b"], width=1.5, style=Qt.PenStyle.DashLine)
+        )
         self._readout.setStyleSheet(self._readout_qss(pal))
         self.update()
 
     # ---------- 数据 ----------
-    def append_sample(self, values: list[float]) -> None:
-        t_ms = self.sample_index * self.dt_ms
+    def append_sample(self, values: list[float], t_ms: float | None = None) -> None:
+        """追加一帧；t_ms 用于 CSV 回放保留原始时间，实时数据仍按索引推导。"""
+        if t_ms is None:
+            t_ms = self.sample_index * self.dt_ms
         self.sample_index += 1
         self.times.append(float(t_ms))
 
@@ -390,6 +420,9 @@ class PlotPage(pg.PlotWidget):
         self._filled = [False] * MAX_CHANNELS
         self._drawn = False
         self._hide_cursor_readout()
+        self._diff_times = [None, None]
+        self._hide_diff_lines()
+        self.diffMeasured.emit({"active": self.diff_mode, "a": None, "b": None})
         self.fft_summary.hide()
         self._place_watermark()
 
@@ -508,6 +541,7 @@ class PlotPage(pg.PlotWidget):
                 self.legend.setVisible(False)
             self._x = None
             self._hide_cursor_readout()
+            self._hide_diff_lines()
             self.fft_summary.hide()
             self._place_watermark()
             return
@@ -518,6 +552,7 @@ class PlotPage(pg.PlotWidget):
             islice(reversed(self.times), 0, shown), dtype=float, count=shown
         )[::-1]
         x = times - times[0]
+        self._x_base_ms = float(times[0])
 
         arrays: list[np.ndarray | None] = [None] * MAX_CHANNELS
         for i in range(MAX_CHANNELS):
@@ -537,6 +572,7 @@ class PlotPage(pg.PlotWidget):
 
         if self.plot_mode == "fft":
             self._draw_fft(times, arrays)
+            self._hide_diff_lines()
         else:
             drawn = False
             for i, y in enumerate(arrays):
@@ -551,6 +587,8 @@ class PlotPage(pg.PlotWidget):
             self.fft_summary.hide()
             if self.auto_scale:
                 self._fit_view(x, [a for a in arrays if a is not None])
+            if self.diff_mode:
+                self._update_diff_readout()
 
         self._rebuild_legend()
         self._place_watermark()
@@ -743,6 +781,96 @@ class PlotPage(pg.PlotWidget):
         self._vline.setVisible(False)
         self._hline.setVisible(False)
 
+    # ---------- 差分测量 ----------
+    def set_diff_mode(self, enabled: bool) -> None:
+        self.diff_mode = bool(enabled)
+        if self.diff_mode:
+            self._hide_cursor_readout()
+        else:
+            self._diff_times = [None, None]
+            self._hide_diff_lines()
+        self.diffMeasured.emit(
+            {"active": self.diff_mode, "a": self._diff_times[0], "b": self._diff_times[1]}
+        )
+        self.update()
+
+    def _hide_diff_lines(self) -> None:
+        if not hasattr(self, "_diff_a_line"):
+            return
+        self._diff_a_line.setVisible(False)
+        self._diff_b_line.setVisible(False)
+
+    def _view_time_at(self, pos: QPointF) -> float | None:
+        scene_pos = self.mapToScene(pos.toPoint())
+        vb = self.getPlotItem().getViewBox()
+        if not vb.sceneBoundingRect().contains(scene_pos):
+            return None
+        return float(vb.mapSceneToView(scene_pos).x()) + self._x_base_ms
+
+    def _index_for_time(self, abs_ms: float) -> int | None:
+        x = self._x
+        if x is None or len(x) == 0:
+            return None
+        target = float(abs_ms) - self._x_base_ms
+        index = int(np.searchsorted(x, target))
+        index = max(0, min(index, len(x) - 1))
+        if index > 0 and abs(x[index - 1] - target) < abs(x[index] - target):
+            index -= 1
+        return index
+
+    def _set_diff_anchor(self, pos: QPointF) -> None:
+        if not self.diff_mode or self.plot_mode != "time":
+            return
+        t_ms = self._view_time_at(pos)
+        if t_ms is None:
+            return
+        if self._diff_times[0] is None or self._diff_times[1] is not None:
+            self._diff_times = [t_ms, None]
+        else:
+            self._diff_times[1] = t_ms
+        self._update_diff_readout()
+
+    def _update_diff_readout(self) -> None:
+        info: dict = {
+            "active": self.diff_mode,
+            "a": self._diff_times[0],
+            "b": self._diff_times[1],
+            "dt_ms": 0.0,
+            "names": [],
+            "dvalues": [],
+        }
+        if not self.diff_mode or self.plot_mode != "time" or self._x is None:
+            self._hide_diff_lines()
+            self.diffMeasured.emit(info)
+            return
+
+        i0 = self._index_for_time(self._diff_times[0]) if self._diff_times[0] is not None else None
+        i1 = self._index_for_time(self._diff_times[1]) if self._diff_times[1] is not None else None
+        if i0 is not None:
+            self._diff_a_line.setPos(float(self._x[i0]))
+            self._diff_a_line.setVisible(True)
+            info["a"] = float(self._x[i0]) + self._x_base_ms
+        else:
+            self._diff_a_line.setVisible(False)
+            info["a"] = None
+        if i1 is not None:
+            self._diff_b_line.setPos(float(self._x[i1]))
+            self._diff_b_line.setVisible(True)
+            info["b"] = float(self._x[i1]) + self._x_base_ms
+        else:
+            self._diff_b_line.setVisible(False)
+            info["b"] = None
+
+        if i0 is not None and i1 is not None:
+            info["dt_ms"] = float(self._x[i1]) - float(self._x[i0])
+            for ch in range(self.channel_count):
+                ys = self._ys[ch]
+                if ys is None or i0 >= len(ys) or i1 >= len(ys):
+                    continue
+                info["names"].append(self.channel_names[ch])
+                info["dvalues"].append(float(ys[i1]) - float(ys[i0]))
+        self.diffMeasured.emit(info)
+
     # ---------- 事件 ----------
     def resizeEvent(self, ev) -> None:
         super().resizeEvent(ev)
@@ -753,12 +881,23 @@ class PlotPage(pg.PlotWidget):
 
     def mousePressEvent(self, ev) -> None:
         self.activated.emit(self)
+        if (
+            self.diff_mode
+            and ev.button() == Qt.LeftButton
+            and self.plot_mode == "time"
+        ):
+            self._set_diff_anchor(ev.position())
+            ev.accept()
+            return
         super().mousePressEvent(ev)
 
     def mouseMoveEvent(self, ev) -> None:
         super().mouseMoveEvent(ev)
         pos = ev.position()
         self._last_mouse = pos
+        if self.diff_mode:
+            # 差分模式下不再画悬浮读数，读数只放统计栏，避免遮挡曲线
+            return
         self._update_cursor_readout(pos)
 
     def leaveEvent(self, ev) -> None:

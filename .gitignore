@@ -12,6 +12,7 @@ pip-wheel-metadata/
 
 # ---- 打包 / 构建产物（本项目直接跑源码，不需要打包）----
 build/
+build_fast/
 dist/
 *.spec
 
