@@ -81,6 +81,7 @@ from .ui.common import (
 )
 from .ui.dialogs import SettingsDialog, VariableDialog
 from .ui.display import DisplayWidgetsPanel
+from .ui.measure import MeasureDialog
 
 if TYPE_CHECKING:
     from .splash import SplashScreen
@@ -154,6 +155,13 @@ class MainWindow(QMainWindow):
         self.worker: SerialWorker | BaseTransport | None = None
         self.connected = False
         self.demo_enabled = False
+        self.sim_mode = str(load_setting("demo/mode", "sine", str))
+        if self.sim_mode not in ("sine", "step", "pid"):
+            self.sim_mode = "sine"
+        self.measure_dialog: MeasureDialog | None = None
+        self._demo_step_period_ms = 4000.0
+        self._demo_last_step_ms = 0.0
+        self.record_unlimited = False
         self.channel_names = [f"I{i}" for i in range(MAX_CHANNELS)]
         self.channel_colors = list(CHANNEL_COLORS)
         self.channel_decimals = [3] * MAX_CHANNELS
@@ -206,6 +214,7 @@ class MainWindow(QMainWindow):
         self._group_colors: dict[str, str] = {}
 
         self.build_ui()
+        self._sync_record_limit()
         self._sync_tx_mode_ui()
         self._sync_rx_mode_ui()
         app = QApplication.instance()
@@ -452,6 +461,8 @@ class MainWindow(QMainWindow):
         dialog = SettingsDialog(self)
         dialog.themeChanged.connect(self.apply_theme)
         dialog.shortcutsChanged.connect(self.apply_shortcuts)
+        dialog.simModeChanged.connect(self.apply_sim_mode)
+        dialog.recordModeChanged.connect(self.apply_record_mode)
         dialog.exec()
 
     @staticmethod
@@ -687,22 +698,25 @@ class MainWindow(QMainWindow):
         stat_l.addWidget(self.rate_label)
         stat_l.addStretch(1)
 
-        # 差分读数放在统计栏（画布之外），避免浮在曲线上遮挡数据
-        self.diff_label = make_label("", "statValue")
-        self.diff_label.setToolTip(
-            "右键波形 → 差分测量 A/B：开启后依次点击波形设置 A、B，差值显示在这里"
+        self.measure_btn = QToolButton()
+        self.measure_btn.setObjectName("flatTool")
+        self.measure_btn.setIcon(icon("measure", 18, ICON_NEUTRAL))
+        self.measure_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self.measure_btn.setCursor(Qt.PointingHandCursor)
+        self.measure_btn.setToolTip(
+            "游标测量：暂停后点击波形设 A（开始）/ B（结束），可拖动微调；点击这里计算性能指标"
         )
-        self.diff_label.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
-        self.diff_label.setVisible(False)
-        stat_l.addWidget(self.diff_label, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.measure_btn.clicked.connect(self.open_measure_dialog)
+        stat_l.addWidget(self.measure_btn, 0, Qt.AlignmentFlag.AlignVCenter)
 
-        # 暂停提示放在统计栏空白处（波形画布之外），不遮挡曲线
-        self.pause_badge = QLabel("已暂停 · 按空格继续")
-        self.pause_badge.setObjectName("pauseBadge")
-        self.pause_badge.setToolTip("波形已暂停，移动鼠标查看数值；按空格继续")
-        self.pause_badge.setVisible(False)
-        stat_l.addWidget(self.pause_badge, 0, Qt.AlignmentFlag.AlignVCenter)
-        stat_l.addSpacing(8)
+        self.record_btn = QToolButton()
+        self.record_btn.setObjectName("flatTool")
+        self.record_btn.setIcon(icon("record", 18, ICON_NEUTRAL))
+        self.record_btn.setCheckable(True)
+        self.record_btn.setChecked(self.record_unlimited)
+        self.record_btn.setToolTip("连续记录模式：不限缓冲长度一直记录，关闭软件自动清除")
+        self.record_btn.toggled.connect(self.apply_record_mode)
+        stat_l.addWidget(self.record_btn, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self.replay_btn = QToolButton()
         self.replay_btn.setObjectName("flatTool")
@@ -1138,7 +1152,6 @@ class MainWindow(QMainWindow):
             lambda enabled, target=page: self._on_page_auto_requested(target, enabled)
         )
         page.activated.connect(self._set_active_page)
-        page.diffMeasured.connect(self._show_diff_readout)
         page.contextMenuRequested.connect(
             lambda pos, target=page: self._show_plot_menu_at(target, pos)
         )
@@ -1191,12 +1204,12 @@ class MainWindow(QMainWindow):
             act.triggered.connect(lambda _=False, p=page, k=key: p.set_fft_scale(k))
         menu.addMenu(scale_menu)
 
-        diff_act = menu.addAction("差分测量 A/B")
+        diff_act = menu.addAction("游标测量 A/B")
         diff_act.setCheckable(True)
         diff_act.setChecked(page.diff_mode)
-        diff_act.setToolTip("开启后依次左键点击波形设置 A、B；差值显示在统计栏，不遮挡曲线")
+        diff_act.setToolTip("暂停后可拖动 A / B 游标；运行时开启会自动暂停，取消勾选即隐藏游标")
         diff_act.toggled.connect(
-            lambda on=False, target=page: target.set_diff_mode(on)
+            lambda on=False, target=page: self._toggle_page_cursor(target, on)
         )
 
         menu.addSeparator()
@@ -1207,6 +1220,11 @@ class MainWindow(QMainWindow):
             lambda on=False, p=page: (p.set_auto_scale(on), p.refresh())
         )
         menu.exec(global_pos)
+
+    def _toggle_page_cursor(self, page: PlotPage, enabled: bool) -> None:
+        if enabled and not self.plot_paused:
+            self.set_plot_paused(True, message=False)
+        page.set_inspect_mode(bool(enabled))
 
     def add_variable(self) -> None:
         """新增一个波形变量槽位，可自定义名称、颜色与参数。"""
@@ -1339,24 +1357,57 @@ class MainWindow(QMainWindow):
             eye.setChecked(visible)
             eye.blockSignals(False)
 
-    def _show_diff_readout(self, info: dict) -> None:
-        """差分读数只更新统计栏，绝不往波形画布上贴浮层。"""
-        if not hasattr(self, "diff_label"):
+    def open_measure_dialog(self) -> None:
+        """打开专用测量面板：非模态，便于边拖游标边看结果。"""
+        page = self.current_page()
+        if self.measure_dialog is None:
+            self.measure_dialog = MeasureDialog(page, self.dark, self)
+        else:
+            self.measure_dialog.set_page(page)
+            self.measure_dialog.raise_()
+            self.measure_dialog.activateWindow()
+        self.measure_dialog.show()
+
+    def apply_sim_mode(self, index: int) -> None:
+        modes = ("sine", "step", "pid")
+        mode = modes[max(0, min(int(index), len(modes) - 1))]
+        if mode == self.sim_mode:
             return
-        a = info.get("a") if info else None
-        b = info.get("b") if info else None
-        if not info or not info.get("active") or a is None or b is None:
-            self.diff_label.setText("")
-            self.diff_label.setVisible(False)
-            return
-        dt = float(info.get("dt_ms", 0.0))
-        parts = [f"Δt {dt:+.1f}ms"]
-        for name, delta in zip(info.get("names", []), info.get("dvalues", [])):
-            parts.append(f"Δ{name} {delta:+.4g}")
-        text = "  ".join(parts)
-        self.diff_label.setText(text)
-        self.diff_label.setToolTip(text.replace("  ", "\n"))
-        self.diff_label.setVisible(True)
+        self.sim_mode = mode
+        save_setting("demo/mode", mode)
+        self._demo_last_step_ms = 0.0
+        self.clear_plot()
+        for target in self.pages:
+            target.clear_data()
+            target.refresh()
+        self.statusBar().showMessage(
+            {
+                "sine": "模拟模式：正弦扫描",
+                "step": "模拟模式：阶跃响应",
+                "pid": "模拟模式：PID 响应",
+            }[mode],
+            2500,
+        )
+
+    def _sync_record_limit(self) -> None:
+        limit = 0 if self.record_unlimited else int(self.buffer_spin.value())
+        for page in self.pages:
+            page.set_buffer_limit(limit)
+        self.buffer_spin.setEnabled(not self.record_unlimited)
+
+    def apply_record_mode(self, enabled: bool) -> None:
+        self.record_unlimited = bool(enabled)
+        if hasattr(self, "record_btn"):
+            self.record_btn.blockSignals(True)
+            self.record_btn.setChecked(self.record_unlimited)
+            self.record_btn.blockSignals(False)
+        self._sync_record_limit()
+        self.statusBar().showMessage(
+            "连续记录模式已开启：一直记录，关闭软件自动清除"
+            if self.record_unlimited
+            else "连续记录模式已关闭：恢复缓冲长度限制",
+            3500,
+        )
 
     # ================= 数据源 =================
     def on_tick(self) -> None:
@@ -1410,16 +1461,43 @@ class MainWindow(QMainWindow):
         step = self.dt_ms / 1000.0
         for k in range(frames):
             t = t0 + k * step
+            t_ms = (self.sample_index + k) * self.dt_ms
+            if t_ms % self._demo_step_period_ms < self.dt_ms:
+                self._demo_last_step_ms = t_ms
+            local_t = (t_ms - self._demo_last_step_ms) / 1000.0
             values = []
             for ch in range(channels):
-                freq = 0.8 + ch * 0.5
-                phase = ch * 0.9
-                values.append(
-                    2.0 * math.sin(2 * math.pi * freq * t + phase)
-                    + 0.18 * math.sin(2 * math.pi * 9.0 * t)
-                    + ch * 0.6
-                )
+                if self.sim_mode == "sine":
+                    freq = 0.8 + ch * 0.5
+                    phase = ch * 0.9
+                    value = (
+                        2.0 * math.sin(2 * math.pi * freq * t + phase)
+                        + 0.18 * math.sin(2 * math.pi * 9.0 * t)
+                        + ch * 0.6
+                    )
+                else:
+                    value = self._demo_response(local_t, ch)
+                values.append(value)
             self.append_values(values, from_demo=True)
+
+    def _demo_response(self, t: float, ch: int) -> float:
+        """阶跃 / PID 模拟：带超调与衰减振荡的二阶响应，便于直接测量性能指标。"""
+        delay = 0.02 + ch * 0.01
+        x = t - delay
+        amp = 1.2 + ch * 0.45
+        if x <= 0.0:
+            return 0.0
+        if self.sim_mode == "step":
+            wn = 2 * math.pi * (1.6 + ch * 0.15)
+            zeta = 0.42
+        else:
+            wn = 2 * math.pi * (2.2 + ch * 0.2)
+            zeta = 0.26
+        wd = wn * math.sqrt(1.0 - zeta * zeta)
+        response = 1.0 - math.exp(-zeta * wn * x) * (
+            math.cos(wd * x) + (zeta * wn / wd) * math.sin(wd * x)
+        )
+        return amp * response + 0.012 * math.sin(2 * math.pi * 12.0 * x + ch)
 
     def _demo_remainder_add(self, per_frame: float) -> bool:
         self._demo_acc = getattr(self, "_demo_acc", 0.0) + (per_frame - int(per_frame))
@@ -1943,7 +2021,6 @@ class MainWindow(QMainWindow):
         else:
             self.mode_tag.setText("● 模拟模式")
             self.mode_tag.setObjectName("primary")
-            self._reset_variables(reset_style=True)
             self.statusBar().showMessage(
                 "模拟数据流已断开：移动鼠标查看数值，按空格恢复波形刷新", 4000
             )
@@ -2463,7 +2540,9 @@ class MainWindow(QMainWindow):
             self.dt_ms = float(self.dt_spin.value())
             for page in self.pages:
                 page.set_dt(self.dt_ms)
-                page.set_buffer_limit(int(self.buffer_spin.value()))
+                page.set_buffer_limit(
+                    0 if self.record_unlimited else int(self.buffer_spin.value())
+                )
                 page.set_display_points(int(self.align_spin.value()))
 
             channels = data.get("channels", {})
@@ -2593,8 +2672,12 @@ class MainWindow(QMainWindow):
         self.plot_paused = paused
         for page in self.pages:
             page.set_inspect_mode(paused)
-        if hasattr(self, "pause_badge"):
-            self.pause_badge.setVisible(paused)
+        if paused and self.sim_mode in ("step", "pid") and self.sample_index > 0:
+            start_ms = max(0.0, self._demo_last_step_ms - 30.0)
+            end_ms = self.sample_index * self.dt_ms
+            inset = (end_ms - start_ms) * 0.03
+            for page in self.pages:
+                page.set_inspect_range(start_ms + inset, end_ms - inset)
         if message:
             self.statusBar().showMessage(
                 "波形已暂停：移动鼠标查看数值，按空格继续"
@@ -2986,6 +3069,9 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self.timer.stop()
+        if self.record_unlimited:
+            for page in self.pages:
+                page.clear_data()
         worker = self.worker
         self.worker = None
         if worker is not None:

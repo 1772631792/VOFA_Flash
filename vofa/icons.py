@@ -85,6 +85,7 @@ def icon(name: str, size: int = 16, color: str = "#555555") -> QIcon:
         "record": "<circle cx='8' cy='8' r='5.6' fill='none' stroke='{color}' stroke-width='2.6'/><circle cx='8' cy='8' r='1.6' fill='{color}'/>",
         "layers": "<rect x='2' y='3' width='12' height='2.8' rx='1.4' fill='{color}'/><rect x='2' y='7' width='9' height='2.8' rx='1.4' fill='{color}'/><rect x='2' y='11' width='6' height='2.4' rx='1.2' fill='{color}'/>",
         "docs": "<rect x='5' y='2' width='8' height='10' rx='1' fill='none' stroke='{color}' stroke-width='1.4'/><rect x='2' y='5' width='8' height='10' rx='1' fill='none' stroke='{color}' stroke-width='1.4'/>",
+        "measure": "<path d='M2 12.5L12.5 2M4.5 2h4M2 4.5v4M10 14h4M14 10v4' fill='none' stroke='{color}' stroke-width='1.3' stroke-linecap='round' stroke-linejoin='round'/><circle cx='7.2' cy='7.2' r='2.1' fill='none' stroke='{color}' stroke-width='1.1'/>",
     }
     return _svg_icon(f"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'>{shapes[name]}</svg>", size, color)
 

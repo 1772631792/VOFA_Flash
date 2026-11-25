@@ -8,6 +8,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDoubleSpinBox,
@@ -194,6 +195,8 @@ class SettingsDialog(QDialog):
 
     themeChanged = Signal(bool)
     shortcutsChanged = Signal(dict)
+    simModeChanged = Signal(int)
+    recordModeChanged = Signal(bool)
 
     def __init__(self, window: "MainWindow", parent=None):
         super().__init__(parent)
@@ -208,6 +211,8 @@ class SettingsDialog(QDialog):
         tabs.addTab(self._appearance_tab(window.dark), "外观")
         tabs.addTab(self._shortcut_tab(window), "快捷键")
         tabs.addTab(self._layout_tab(), "布局")
+        tabs.addTab(self._sim_tab(window.sim_mode), "模拟")
+        tabs.addTab(self._record_tab(window.record_unlimited), "记录")
         root.addWidget(tabs, 1)
 
         buttons = hbox(spacing=8)
@@ -219,6 +224,47 @@ class SettingsDialog(QDialog):
         buttons.addWidget(done_btn)
         root.addLayout(buttons)
         self.setLayout(root)
+
+    def _sim_tab(self, mode: str) -> QWidget:
+        page = QWidget()
+        lay = vbox((18, 18, 18, 14), 10)
+        lay.addWidget(make_label("模拟数据模式", "sectionBlue"))
+        self.sim_combo = QComboBox()
+        self.sim_combo.addItems(
+            ["正弦扫描（当前）", "阶跃响应（自动控制）", "PID 响应（自动控制）"]
+        )
+        self.sim_combo.setCurrentIndex({"sine": 0, "step": 1, "pid": 2}.get(mode, 0))
+        self.sim_combo.setToolTip("切换后波形数据从零重新开始")
+        lay.addWidget(self.sim_combo)
+        lay.addWidget(
+            make_label(
+                "阶跃 / PID 模式输出带超调的二阶阶跃曲线；\n"
+                "暂停波形后可拖动 A / B 游标，再用「测量」按钮计算性能指标。",
+                "tinyMuted",
+            )
+        )
+        lay.addStretch(1)
+        page.setLayout(lay)
+        return page
+
+    def _record_tab(self, enabled: bool) -> QWidget:
+        page = QWidget()
+        lay = vbox((18, 18, 18, 14), 10)
+        lay.addWidget(make_label("连续记录模式", "sectionBlue"))
+        self.record_check = QCheckBox("不限缓冲长度，一直记录全部数据")
+        self.record_check.setChecked(bool(enabled))
+        self.record_check.setToolTip("开启后不再按缓冲长度覆盖旧数据")
+        lay.addWidget(self.record_check)
+        lay.addWidget(
+            make_label(
+                "适合长时间观察曲线变化，历史数据不会被覆盖；\n"
+                "关闭软件时会自动清除这些记录，不会保存到磁盘。",
+                "tinyMuted",
+            )
+        )
+        lay.addStretch(1)
+        page.setLayout(lay)
+        return page
 
     def _appearance_tab(self, dark: bool) -> QWidget:
         page = QWidget()
@@ -326,6 +372,8 @@ class SettingsDialog(QDialog):
         if mapping is None:
             return
         self.shortcutsChanged.emit(mapping)
+        self.simModeChanged.emit(self.sim_combo.currentIndex())
+        self.recordModeChanged.emit(self.record_check.isChecked())
         self.accept()
 
     def _export_layout_dialog(self) -> None:
