@@ -803,6 +803,7 @@ class TriAxisCard(QFrame):
     """显示控件卡片：三轴视图 + X/Y/Z 独立通道绑定。"""
 
     closed = Signal(object)
+    floatRequested = Signal(object)
 
     def __init__(self, unit: str = "deg", parent=None):
         super().__init__(parent)
@@ -922,6 +923,44 @@ class TriAxisCard(QFrame):
     def set_dark(self, dark: bool) -> None:
         self.axis.set_dark(dark)
 
+    def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
+        child = self.childAt(event.position().toPoint())
+        if isinstance(child, (QComboBox, QToolButton, QPushButton)):
+            event.ignore()
+            return
+        self.floatRequested.emit(self)
+        event.accept()
+
+
+class FloatingCardWindow(QWidget):
+    """三轴卡片的临时悬浮宿主；Esc 或关闭时把卡片放回原位置。"""
+
+    restoreRequested = Signal(object)
+
+    def __init__(self, card: TriAxisCard, parent=None):
+        super().__init__(parent)
+        self.card = card
+        self.setObjectName("floatingCardWindow")
+        self.setWindowTitle("三轴坐标系 · 悬浮显示")
+        self.setWindowFlags(Qt.WindowType.Window)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setMinimumSize(520, 620)
+        lay = vbox((16, 12, 16, 16), 10)
+        lay.addWidget(make_label("双击卡片空白处可放大，按 Esc 返回", "tinyMuted"))
+        lay.addWidget(card, 1)
+        self.setLayout(lay)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        if event.key() == Qt.Key_Escape:
+            self.close()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self.restoreRequested.emit(self)
+        super().closeEvent(event)
+
 
 class DisplayWidgetsPanel(QFrame):
     """左侧显示控件栏：可添加多个三轴坐标系并独立绑定数据。"""
@@ -929,33 +968,34 @@ class DisplayWidgetsPanel(QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("displayPanel")
-        self.setMinimumWidth(220)
-        self.setMaximumWidth(420)
+        self.setMinimumWidth(200)
         self.unit = "deg"
         self._dark = False
         self._provider = None
         self.cards: list[TriAxisCard] = []
+        self._floats: dict[TriAxisCard, FloatingCardWindow] = {}
+        self._anchors: dict[TriAxisCard, tuple[int, QWidget]] = {}
 
         lay = vbox((12, 12, 12, 12), 10)
         head = hbox(spacing=6)
         head.addWidget(make_label("显示控件", "titleBlue"))
         head.addStretch(1)
 
-        self.unit_deg = QPushButton("deg")
+        self.unit_deg = QPushButton("角度")
         self.unit_deg.setObjectName("unitBtn")
         self.unit_deg.setProperty("unitSegment", "first")
         self.unit_deg.setCheckable(True)
         self.unit_deg.setChecked(True)
-        self.unit_deg.setFixedSize(36, 24)
+        self.unit_deg.setFixedSize(44, 24)
         self.unit_deg.setToolTip("按角度制解释 Rx 数据")
         self.unit_deg.clicked.connect(lambda _=False: self.set_unit("deg"))
         head.addWidget(self.unit_deg)
 
-        self.unit_rad = QPushButton("rad")
+        self.unit_rad = QPushButton("弧度")
         self.unit_rad.setObjectName("unitBtn")
         self.unit_rad.setProperty("unitSegment", "last")
         self.unit_rad.setCheckable(True)
-        self.unit_rad.setFixedSize(36, 24)
+        self.unit_rad.setFixedSize(44, 24)
         self.unit_rad.setToolTip("按弧度制解释 Rx 数据")
         self.unit_rad.clicked.connect(lambda _=False: self.set_unit("rad"))
         head.addWidget(self.unit_rad)
@@ -1003,6 +1043,7 @@ class DisplayWidgetsPanel(QFrame):
     def add_tri_axis(self) -> None:
         card = TriAxisCard(unit=self.unit)
         card.closed.connect(self.remove_card)
+        card.floatRequested.connect(self.float_card)
         card.set_dark(self._dark)
         self.cards.append(card)
         self.list_layout.insertWidget(self.list_layout.count() - 1, card)
@@ -1010,12 +1051,50 @@ class DisplayWidgetsPanel(QFrame):
         self.refresh_from_data()
         self.scroll.ensureWidgetVisible(card)
 
+    def float_card(self, card: TriAxisCard) -> None:
+        if card in self._floats or card not in self.cards:
+            return
+        index = self.list_layout.indexOf(card)
+        if index < 0:
+            return
+        placeholder = QWidget(self.list_widget)
+        placeholder.setFixedHeight(card.height())
+        self.list_layout.removeWidget(card)
+        self.list_layout.insertWidget(index, placeholder)
+        window = FloatingCardWindow(card, self)
+        window.restoreRequested.connect(self._restore_float)
+        self._floats[card] = window
+        self._anchors[card] = (index, placeholder)
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    def _restore_float(self, window: FloatingCardWindow) -> None:
+        card = window.card
+        if card not in self._floats:
+            return
+        index, placeholder = self._anchors.pop(card)
+        self._floats.pop(card, None)
+        window.layout().removeWidget(card)
+        placeholder.setParent(None)
+        self.list_layout.insertWidget(index, card)
+        card.show()
+        self.scroll.ensureWidgetVisible(card)
+
     def remove_card(self, card: TriAxisCard) -> None:
+        if card in self._floats:
+            window = self._floats[card]
+            self._restore_float(window)
+            window.close()
         if card in self.cards:
             self.cards.remove(card)
         card.deleteLater()
         if not self.cards:
             self.empty_hint.show()
+
+    def close_all_float_windows(self) -> None:
+        for window in list(self._floats.values()):
+            window.close()
 
     def refresh_from_data(self) -> None:
         if self._provider is None or not self.cards:
@@ -1068,6 +1147,7 @@ class MainWindow(QMainWindow):
         self.plot_paused = False
         self.plot_layout_mode = 1
         self.active_page: PlotPage | None = None
+        self.page_mode_locked = [False, False, False]
         self.rx_hex_mode = True
         self.hex_mode = True
         self.filter_rx = False
@@ -1146,8 +1226,15 @@ class MainWindow(QMainWindow):
         center_right = QSplitter(Qt.Horizontal)
         center_right.setChildrenCollapsible(False)
         center_right.setHandleWidth(4)
-        center_right.addWidget(self.build_center_area())
-        center_right.addWidget(self.build_rightbar())
+        center_area = self.build_center_area()
+        rightbar = self.build_rightbar()
+        # 中间区域保留最小可视空间，其余宽度让给两侧面板自由拖动
+        center_area.setMinimumWidth(320)
+        center_area.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        rightbar.setMinimumWidth(140)
+        rightbar.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        center_right.addWidget(center_area)
+        center_right.addWidget(rightbar)
         center_right.setSizes([1100, 250])
         center_right.setStretchFactor(0, 1)
         center_right.setStretchFactor(1, 0)
@@ -1168,6 +1255,7 @@ class MainWindow(QMainWindow):
         body.setStretchFactor(1, 0)
         body.setStretchFactor(2, 0)
         body.setStretchFactor(3, 1)
+        body.splitterMoved.connect(self._remember_panel_widths)
         self.body_splitter = body
 
         root_l.addWidget(body, 1)
@@ -1424,8 +1512,7 @@ class MainWindow(QMainWindow):
     def build_command_drawer(self) -> QWidget:
         drawer = QFrame()
         drawer.setObjectName("drawer")
-        drawer.setMinimumWidth(236)
-        drawer.setMaximumWidth(430)
+        drawer.setMinimumWidth(200)
 
         main = vbox((14, 12, 14, 12), 10)
         head = hbox(spacing=8)
@@ -1579,13 +1666,13 @@ class MainWindow(QMainWindow):
         stat_l.addStretch(1)
 
         # 差分读数放在统计栏（画布之外），避免浮在曲线上遮挡数据
-        self.diff_label = make_label("A/B 差分：未开启", "statValue")
+        self.diff_label = make_label("", "statValue")
         self.diff_label.setToolTip(
             "右键波形 → 差分测量 A/B：开启后依次点击波形设置 A、B，差值显示在这里"
         )
         self.diff_label.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+        self.diff_label.setVisible(False)
         stat_l.addWidget(self.diff_label, 0, Qt.AlignmentFlag.AlignVCenter)
-        stat_l.addSpacing(8)
 
         # 暂停提示放在统计栏空白处（波形画布之外），不遮挡曲线
         self.pause_badge = QLabel("已暂停 · 按空格继续")
@@ -1786,7 +1873,7 @@ class MainWindow(QMainWindow):
         outer = vbox((0, 0, 0, 0), 0)
 
         self.right_body = QWidget()
-        lay = vbox((14, 14, 14, 14), 8)
+        lay = vbox((14, 10, 14, 10), 8)
 
         head = hbox(spacing=8)
         head.addWidget(make_label("◔", "muted"))
@@ -1803,16 +1890,44 @@ class MainWindow(QMainWindow):
         lay.addLayout(head)
         lay.addWidget(make_hr())
 
-        self.channel_rows: list[ChannelRow] = []
-        for i in range(MAX_CHANNELS):
-            row = ChannelRow(i, CHANNEL_COLORS[i])
-            row.toggled.connect(self.on_channel_toggled)
-            row.selected.connect(self._select_channel)
-            row.editRequested.connect(self.edit_variable)
-            row.contextMenuRequested.connect(self._show_variable_menu_at)
-            row.setVisible(False)
-            self.channel_rows.append(row)
-            lay.addWidget(row)
+        self.channel_rows_by_page: list[list[ChannelRow]] = []
+        self.page_groups: list[QFrame] = []
+        self.page_group_titles: list[QLabel] = []
+        for page_index in range(3):
+            group = QFrame()
+            group.setObjectName("windowVarGroup")
+            group.setStyleSheet(
+                "#windowVarGroup {"
+                " border: 1px solid rgba(120,150,190,48);"
+                " border-radius: 8px;"
+                " background: rgba(255,255,255,96);"
+                "}"
+            )
+            group_lay = vbox((8, 8, 8, 8), 4)
+            title = make_label(f"窗口 {page_index + 1}", "sectionBlue")
+            self.page_group_titles.append(title)
+            group_lay.addWidget(title)
+
+            rows: list[ChannelRow] = []
+            for i in range(MAX_CHANNELS):
+                row = ChannelRow(i, CHANNEL_COLORS[i])
+                row.toggled.connect(
+                    lambda idx, on, pi=page_index: self.on_channel_toggled(pi, idx, on)
+                )
+                row.selected.connect(
+                    lambda idx, pi=page_index: self._select_channel(idx, pi)
+                )
+                row.editRequested.connect(lambda idx: self.edit_variable(idx))
+                row.contextMenuRequested.connect(
+                    lambda idx, pos, pi=page_index: self._show_variable_menu_at(idx, pos, pi)
+                )
+                row.setVisible(False)
+                rows.append(row)
+                group_lay.addWidget(row)
+            group.setLayout(group_lay)
+            self.channel_rows_by_page.append(rows)
+            self.page_groups.append(group)
+            lay.addWidget(group)
 
         self.empty_hint = make_label(
             "暂无变量\n接收到数据后会自动显示变量", "emptyHint"
@@ -1822,7 +1937,15 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.empty_hint)
         lay.addStretch(1)
         self.right_body.setLayout(lay)
-        outer.addWidget(self.right_body, 1)
+
+        self.right_scroll = QScrollArea()
+        self.right_scroll.setObjectName("rightScroll")
+        self.right_scroll.setWidgetResizable(True)
+        self.right_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.right_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.right_scroll.setWidget(self.right_body)
+        outer.addWidget(self.right_scroll, 1)
 
         self.right_strip = QFrame()
         self.right_strip.setObjectName("railRight")
@@ -1857,14 +1980,14 @@ class MainWindow(QMainWindow):
         if collapsed:
             if len(sizes) > 1 and sizes[1] > 120:
                 self._right_width = sizes[1]
-            self.right_body.setVisible(False)
+            self.right_scroll.setVisible(False)
             self.right_strip.setVisible(True)
             self.right_panel.setMinimumWidth(48)
             self.right_panel.setMaximumWidth(48)
             splitter.setSizes([max(200, total - 48), 48])
         else:
             self.right_strip.setVisible(False)
-            self.right_body.setVisible(True)
+            self.right_scroll.setVisible(True)
             self.right_panel.setMinimumWidth(190)
             self.right_panel.setMaximumWidth(400)
             width = max(190, min(400, self._right_width))
@@ -1872,9 +1995,24 @@ class MainWindow(QMainWindow):
 
     # ================= 波形页 =================
     def current_page(self) -> PlotPage:
-        if self.active_page is not None and self.active_page in self.pages:
+        pages = getattr(self, "pages", [])
+        if pages and self.active_page in pages:
             return self.active_page
-        return self.pages[0]
+        return pages[0] if pages else None  # type: ignore[return-value]
+
+    def _page_index(self, page: PlotPage | None) -> int:
+        pages = getattr(self, "pages", [])
+        if page in pages:
+            return pages.index(page)
+        return 0
+
+    @property
+    def channel_rows(self) -> list[ChannelRow]:
+        groups = getattr(self, "channel_rows_by_page", [])
+        if not groups:
+            return []
+        index = min(self._page_index(self.current_page()), len(groups) - 1)
+        return groups[index]
 
     def _set_active_page(self, page: PlotPage) -> None:
         if page not in self.pages:
@@ -1882,16 +2020,78 @@ class MainWindow(QMainWindow):
         self.active_page = page
         if hasattr(self, "rx_count_label"):
             self.update_stats(page)
+        self._sync_auto_label_from_page(page)
+        self._sync_variable_groups()
+
+    def _sync_auto_label_from_page(self, page: PlotPage | None = None) -> None:
+        if not hasattr(self, "auto_label"):
+            return
+        page = page or self.current_page()
+        if page is None:
+            return
+        self.auto_label.blockSignals(True)
+        self.auto_label.setChecked(bool(page.auto_scale))
+        self.auto_label.blockSignals(False)
+
+    def _sync_variable_groups(self) -> None:
+        groups = getattr(self, "page_groups", [])
+        if not groups:
+            return
+        active = self._page_index(self.current_page())
+        for index, group in enumerate(groups):
+            group.setVisible(index < self.plot_layout_mode)
+            if index < len(self.page_group_titles):
+                title = self.page_group_titles[index]
+                if index == active:
+                    title.setText(f"窗口 {index + 1} · 当前")
+                    title.setStyleSheet("color:#0A84E8;font-weight:bold;")
+                else:
+                    title.setText(f"窗口 {index + 1}")
+                    title.setStyleSheet("color:#5C7189;")
+        self._update_empty_hint()
+
+    def _apply_smart_modes(self, mode: int) -> None:
+        plans = {1: ("time", "time", "time"), 2: ("fft", "time", "time"), 3: ("fft", "time", "time")}
+        for index, page in enumerate(self.pages):
+            if index >= mode or self.page_mode_locked[index]:
+                continue
+            target = plans[mode][index]
+            if page.plot_mode != target:
+                page.set_plot_mode(target)
+        if mode >= 3 and not self.page_mode_locked[2] and len(self.pages) > 2:
+            detail = self.pages[2]
+            detail.set_display_points(min(400, detail.display_points or 400))
+            show_count = min(4, self.channel_count)
+            for index in range(MAX_CHANNELS):
+                detail.set_visible(index, index < show_count)
+
+    def _set_page_mode_lock(self, index: int, locked: bool) -> None:
+        if 0 <= index < len(self.page_mode_locked):
+            self.page_mode_locked[index] = bool(locked)
+
+    def _set_page_mode(self, page: PlotPage, mode: str) -> None:
+        page.set_plot_mode(mode)
+        self._set_page_mode_lock(self._page_index(page), True)
+        page.refresh()
 
     def set_plot_layout(self, mode: int, message: bool = True) -> None:
         mode = max(1, min(3, int(mode)))
         self.plot_layout_mode = mode
+        self._apply_smart_modes(mode)
         height = self.plot_splitter.height() or 600
+        weights = {1: (1,), 2: (1, 1), 3: (3, 4, 3)}[mode]
+        total = sum(weights)
         sizes: list[int] = []
-        for i, page in enumerate(self.pages):
-            visible = i == 0 or (i == 1 and mode >= 2) or (i == 2 and mode >= 3)
+        for index, page in enumerate(self.pages):
+            visible = index < mode
             page.setVisible(visible)
-            sizes.append(height // mode if visible else 0)
+            sizes.append(height * weights[index] // total if visible else 0)
+        remaining = height - sum(sizes)
+        for index in range(mode - 1, -1, -1):
+            if remaining <= 0:
+                break
+            sizes[index] += 1
+            remaining -= 1
         self.plot_splitter.setSizes(sizes)
         self.view2_btn.setChecked(mode == 2)
         self.view3_btn.setChecked(mode == 3)
@@ -1900,17 +2100,21 @@ class MainWindow(QMainWindow):
         for page in self.pages:
             if page.isVisible():
                 page.refresh()
+        self._sync_variable_groups()
+        self._update_channel_rows()
         if message:
             self.statusBar().showMessage(f"波形窗口：{mode} 窗显示", 2000)
 
     def _create_page(self) -> None:
         page = PlotPage(dark=self.dark)
         page.set_channel_count(self.channel_count)
-        page.set_auto_scale(
-            self.auto_label.isChecked() if hasattr(self, "auto_label") else True
-        )
+        page.set_auto_scale(True)
+        for index in range(MAX_CHANNELS):
+            page.set_visible(index, True)
         page.set_inspect_mode(self.plot_paused)
-        page.autoScaleRequested.connect(self.auto_label.setChecked)
+        page.autoScaleRequested.connect(
+            lambda enabled, target=page: self._on_page_auto_requested(target, enabled)
+        )
         page.activated.connect(self._set_active_page)
         page.diffMeasured.connect(self._show_diff_readout)
         page.contextMenuRequested.connect(
@@ -1925,9 +2129,10 @@ class MainWindow(QMainWindow):
             self.active_page = page
 
     def _show_plot_menu_at(self, page: PlotPage, global_pos) -> None:
-        """波形区右键菜单：模式、FFT、变量、Auto、导出与清空。"""
+        """波形区右键菜单：所有操作只作用于被右键的窗口。"""
         self._set_active_page(page)
-        menu = self._build_variable_menu()
+        page_index = self._page_index(page)
+        menu = self._build_variable_menu(page=page)
 
         display_menu = QMenu("显示模式", menu)
         time_act = display_menu.addAction("时域波形")
@@ -1938,8 +2143,14 @@ class MainWindow(QMainWindow):
         ):
             action.setCheckable(True)
             action.setChecked(checked)
-        time_act.triggered.connect(lambda _=False, p=page: p.set_plot_mode("time"))
-        fft_act.triggered.connect(lambda _=False, p=page: p.set_plot_mode("fft"))
+        time_act.triggered.connect(lambda _=False, p=page: self._set_page_mode(p, "time"))
+        fft_act.triggered.connect(lambda _=False, p=page: self._set_page_mode(p, "fft"))
+        smart_act = display_menu.addAction("跟随布局自动切换")
+        smart_act.setCheckable(True)
+        smart_act.setChecked(not self.page_mode_locked[page_index])
+        smart_act.triggered.connect(
+            lambda _=False, idx=page_index: self._set_page_mode_lock(idx, False)
+        )
         menu.addMenu(display_menu)
 
         window_menu = QMenu("FFT 窗函数", menu)
@@ -1969,8 +2180,10 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         auto_act = menu.addAction("Auto 自动量程")
         auto_act.setCheckable(True)
-        auto_act.setChecked(self.auto_label.isChecked())
-        auto_act.toggled.connect(self.auto_label.setChecked)
+        auto_act.setChecked(page.auto_scale)
+        auto_act.toggled.connect(
+            lambda on=False, p=page: (p.set_auto_scale(on), p.refresh())
+        )
         menu.exec(global_pos)
 
     def add_variable(self) -> None:
@@ -2042,26 +2255,33 @@ class MainWindow(QMainWindow):
         for page in self.pages:
             page.set_channel_color(index, color)
             page.set_channel_name(index, name)
-            page.set_visible(index, True)
-        row = self.channel_rows[index]
-        row.set_name(name)
-        row.set_color(color)
-        row.eye.setChecked(True)
+        for page_index, rows in enumerate(getattr(self, "channel_rows_by_page", [])):
+            row = rows[index]
+            row.set_name(name)
+            row.set_color(color)
+            if index < self.channel_count:
+                page = self.pages[page_index] if page_index < len(self.pages) else None
+                row.eye.blockSignals(True)
+                row.eye.setChecked(bool(page.visible[index]) if page else True)
+                row.eye.blockSignals(False)
 
-    def _show_variable_menu_at(self, index: int, global_pos) -> None:
-        self._select_channel(index)
-        self._build_variable_menu(index).exec(global_pos)
+    def _show_variable_menu_at(self, index: int, global_pos, page_index: int | None = None) -> None:
+        self._select_channel(index, page_index)
+        page = self.pages[page_index] if page_index is not None and page_index < len(self.pages) else None
+        self._build_variable_menu(index, page).exec(global_pos)
 
-    def _build_variable_menu(self, index: int | None = None) -> QMenu:
+    def _build_variable_menu(self, index: int | None = None, page: PlotPage | None = None) -> QMenu:
+        page = page or self.current_page()
+        page_index = self._page_index(page)
         menu = QMenu(self)
         vis_menu = QMenu("显示变量", menu)
         menu.addMenu(vis_menu)
         for i in range(self.channel_count):
             act = vis_menu.addAction(self.channel_names[i])
             act.setCheckable(True)
-            act.setChecked(self.channel_rows[i].eye.isChecked())
+            act.setChecked(bool(page.visible[i]) if page is not None else True)
             act.toggled.connect(
-                lambda on, idx=i: self.channel_rows[idx].eye.setChecked(on)
+                lambda on, idx=i, pi=page_index, p=page: self._set_page_variable_visible(pi, p, idx, on)
             )
         vis_menu.setEnabled(self.channel_count > 0)
 
@@ -2071,24 +2291,41 @@ class MainWindow(QMainWindow):
 
         menu.addSeparator()
         menu.addAction("导入 CSV 回放…", self.import_csv_replay)
-        menu.addAction("导出数据 CSV…", self.export_csv)
-        menu.addAction("导出图片 PNG…", self.save_screenshot)
-        menu.addAction("清空波形", self.clear_plot)
+        menu.addAction(
+            "导出数据 CSV…",
+            lambda _=False, p=page: self.export_csv(page=p),
+        )
+        menu.addAction(
+            "导出图片 PNG…",
+            lambda _=False, p=page: self.save_screenshot(page=p),
+        )
+        menu.addAction(
+            "清空本窗口",
+            lambda _=False, p=page: self.clear_page(p),
+        )
         return menu
+
+    def _set_page_variable_visible(self, page_index: int, page: PlotPage | None, index: int, visible: bool) -> None:
+        if page is None:
+            return
+        page.set_visible(index, visible)
+        page.refresh()
+        rows = getattr(self, "channel_rows_by_page", [])
+        if 0 <= page_index < len(rows) and index < len(rows[page_index]):
+            eye = rows[page_index][index].eye
+            eye.blockSignals(True)
+            eye.setChecked(visible)
+            eye.blockSignals(False)
 
     def _show_diff_readout(self, info: dict) -> None:
         """差分读数只更新统计栏，绝不往波形画布上贴浮层。"""
         if not hasattr(self, "diff_label"):
             return
-        if not info or not info.get("active"):
-            self.diff_label.setText("差分：未开启")
-            return
-        a = info.get("a")
-        b = info.get("b")
-        if a is None or b is None:
-            self.diff_label.setText(
-                "差分：点击波形设置 B" if a is not None else "差分：点击波形设置 A"
-            )
+        a = info.get("a") if info else None
+        b = info.get("b") if info else None
+        if not info or not info.get("active") or a is None or b is None:
+            self.diff_label.setText("")
+            self.diff_label.setVisible(False)
             return
         dt = float(info.get("dt_ms", 0.0))
         parts = [f"Δt {dt:+.1f}ms"]
@@ -2097,6 +2334,7 @@ class MainWindow(QMainWindow):
         text = "  ".join(parts)
         self.diff_label.setText(text)
         self.diff_label.setToolTip(text.replace("  ", "\n"))
+        self.diff_label.setVisible(True)
 
     # ================= 数据源 =================
     def on_tick(self) -> None:
@@ -2107,7 +2345,9 @@ class MainWindow(QMainWindow):
     def update_plot(self) -> None:
         page = self.current_page()
         if not self.plot_paused:
-            page.refresh()
+            for target in self.pages:
+                if target.isVisible():
+                    target.refresh()
         self.update_stats(page)
         self._refresh_channel_values()
         if hasattr(self, "display_panel"):
@@ -2484,9 +2724,17 @@ class MainWindow(QMainWindow):
             return
         self._toggle_demo_stream()
 
+    def _remember_panel_widths(self) -> None:
+        if not hasattr(self, "body_splitter"):
+            return
+        if self.display_panel.isVisible():
+            self._display_width = max(200, self.display_panel.width())
+        if self.drawer.isVisible():
+            self._drawer_width = max(200, self.drawer.width())
+
     def toggle_command_drawer(self) -> None:
         if self.drawer.isVisible():
-            self._drawer_width = max(220, self.drawer.width())
+            self._drawer_width = max(200, self.drawer.width())
             self.drawer.setVisible(False)
             self.btn_cmd.setChecked(False)
         else:
@@ -2501,7 +2749,7 @@ class MainWindow(QMainWindow):
 
     def toggle_display_panel(self) -> None:
         if self.display_panel.isVisible():
-            self._display_width = max(220, self.display_panel.width())
+            self._display_width = max(200, self.display_panel.width())
             self.display_panel.setVisible(False)
             self.btn_widgets.setChecked(False)
         else:
@@ -2918,6 +3166,15 @@ class MainWindow(QMainWindow):
             self.update_stats(self.current_page())
 
     # ================= 波形 / 通道 =================
+    def clear_page(self, page: PlotPage | None = None) -> None:
+        page = page or self.current_page()
+        page.clear_data()
+        page.refresh()
+        self.update_stats(page)
+        self.statusBar().showMessage(
+            f"窗口 {self._page_index(page) + 1} 波形已清空", 3000
+        )
+
     def clear_plot(self) -> None:
         self.total_frames = 0
         self.total_tx = 0
@@ -2929,19 +3186,24 @@ class MainWindow(QMainWindow):
         self.update_stats(self.current_page())
         self.statusBar().showMessage("波形已清空", 3000)
 
-    def save_screenshot(self, path: str | bool | None = None) -> None:
+    def save_screenshot(
+        self, path: str | bool | None = None, page: PlotPage | None = None
+    ) -> None:
+        page = page or self.current_page()
         if not isinstance(path, str):
             path, _ = QFileDialog.getSaveFileName(
                 self, "导出曲线图片", "waveform.png", "PNG 图片 (*.png)"
             )
         if not path:
             return
-        if self.current_page().grab().save(path):
+        if page.grab().save(path):
             self.statusBar().showMessage(f"图片已保存：{path}", 4000)
 
-    def export_csv(self, path: str | bool | None = None) -> None:
-        """把当前波形页的缓冲数据导出为 CSV。"""
-        page = self.current_page()
+    def export_csv(
+        self, path: str | bool | None = None, page: PlotPage | None = None
+    ) -> None:
+        """把指定波形页的缓冲数据导出为 CSV。"""
+        page = page or self.current_page()
         if page.total_points() == 0:
             QMessageBox.information(self, "没有数据", "当前波形没有可导出的数据")
             return
@@ -3023,6 +3285,16 @@ class MainWindow(QMainWindow):
         if self.worker is not None or self.connected:
             self._disconnect()
 
+        page_states = [
+            (
+                page.plot_mode,
+                list(page.visible[:MAX_CHANNELS]),
+                bool(page.auto_scale),
+                dict(page.fft_settings),
+                bool(page.diff_mode),
+            )
+            for page in self.pages
+        ]
         data_columns = max((len(row) - 1 for row in data_rows), default=0)
         count = max(1, min(max(len(names), data_columns), MAX_CHANNELS))
         self.channel_count = count
@@ -3046,6 +3318,17 @@ class MainWindow(QMainWindow):
             self.total_frames += 1
             self.sample_index += 1
             self.last_values[:count] = values[:count]
+        for page, (mode, visible, auto_scale, fft_settings, diff_mode) in zip(
+            self.pages, page_states
+        ):
+            page.set_plot_mode(mode)
+            for i in range(MAX_CHANNELS):
+                page.set_visible(i, visible[i])
+            page.set_auto_scale(auto_scale)
+            page.set_diff_mode(diff_mode)
+            page.set_fft_window(fft_settings.get("window", "hann"))
+            page.set_fft_scale(fft_settings.get("scale", "percent"))
+            page.set_fft_size(fft_settings.get("fft_size", 0))
         self._refresh_channel_values()
         self.update_plot()
         self.statusBar().showMessage(f"已回放 {len(parsed)} 行数据：{path}", 4000)
@@ -3069,19 +3352,31 @@ class MainWindow(QMainWindow):
                 self.channel_rows[i].eye.isChecked() for i in range(MAX_CHANNELS)
             ],
         }
+        pages = [
+            {
+                "visible": list(page.visible[:MAX_CHANNELS]),
+                "auto_scale": bool(page.auto_scale),
+                "plot_mode": page.plot_mode,
+                "fft_settings": dict(page.fft_settings),
+                "diff_mode": bool(page.diff_mode),
+                "mode_locked": bool(self.page_mode_locked[index]),
+            }
+            for index, page in enumerate(self.pages)
+        ]
         payload = {
             "format": "vofa-flash-layout",
-            "version": 1,
+            "version": 2,
             "window": {"geometry": bytes(self.saveGeometry()).hex()},
             "appearance": {"dark": self.dark},
             "plot": {
                 "layout": self.plot_layout_mode,
-                "auto_scale": self.auto_label.isChecked(),
+                "auto_scale": bool(self.current_page().auto_scale),
                 "dt_ms": self.dt_spin.value(),
                 "buffer": self.buffer_spin.value(),
                 "align": self.align_spin.value(),
                 "splitter": list(self.plot_splitter.sizes()),
             },
+            "pages": pages,
             "panels": {
                 "body": list(self.body_splitter.sizes()),
                 "center": list(self.center_splitter.sizes()),
@@ -3167,16 +3462,28 @@ class MainWindow(QMainWindow):
                 except (TypeError, ValueError):
                     pass
             visible = [bool(value) for value in channels.get("visible", [])]
-            self._update_channel_rows()
-            for page in self.pages:
+            pages_cfg = data.get("pages", [])
+            auto_scale = bool(plot.get("auto_scale", True))
+            for index, page in enumerate(self.pages):
+                cfg = pages_cfg[index] if index < len(pages_cfg) else {}
+                page_visible = [bool(v) for v in cfg.get("visible", visible)]
                 page.set_channel_count(count)
                 for i in range(MAX_CHANNELS):
                     page.set_channel_color(i, self.channel_colors[i])
                     page.set_channel_name(i, self.channel_names[i])
-                    page.set_visible(i, visible[i] if i < len(visible) else True)
-            for i, row in enumerate(self.channel_rows):
-                if i < count:
-                    row.eye.setChecked(visible[i] if i < len(visible) else True)
+                    page.set_visible(i, page_visible[i] if i < len(page_visible) else True)
+                page.set_auto_scale(bool(cfg.get("auto_scale", auto_scale)))
+                page.set_plot_mode(str(cfg.get("plot_mode", "time")))
+                page.set_diff_mode(bool(cfg.get("diff_mode", False)))
+                fft_cfg = cfg.get("fft_settings", {})
+                if isinstance(fft_cfg, dict):
+                    if "window" in fft_cfg:
+                        page.set_fft_window(str(fft_cfg["window"]))
+                    if "scale" in fft_cfg:
+                        page.set_fft_scale(str(fft_cfg["scale"]))
+                    if "fft_size" in fft_cfg:
+                        page.set_fft_size(int(fft_cfg["fft_size"]))
+                self.page_mode_locked[index] = bool(cfg.get("mode_locked", False))
 
             panels = data.get("panels", {})
             self.set_data_panel_collapsed(
@@ -3190,11 +3497,9 @@ class MainWindow(QMainWindow):
             self.btn_cmd.setChecked(show_drawer)
 
             self.set_plot_layout(int(plot.get("layout", self.plot_layout_mode)), message=False)
-            auto_scale = bool(plot.get("auto_scale", True))
-            self.auto_label.setChecked(auto_scale)
-            for page in self.pages:
-                page.set_auto_scale(auto_scale)
-                page.refresh()
+            self._sync_auto_label_from_page(self.current_page())
+            self._sync_variable_groups()
+            self._update_channel_rows()
 
             def apply_sizes(splitter, sizes) -> None:
                 if not isinstance(sizes, list) or len(sizes) != len(splitter.sizes()):
@@ -3226,22 +3531,38 @@ class MainWindow(QMainWindow):
         for page in self.pages:
             page.set_display_points(value)
 
+    def _on_page_auto_requested(self, page: PlotPage, enabled: bool) -> None:
+        self._sync_auto_label_from_page(page)
+
     def toggle_auto_scale(self, checked: bool) -> None:
-        for page in self.pages:
-            page.set_auto_scale(checked)
-            page.refresh()
+        page = self.current_page()
+        if page is None:
+            return
+        page.set_auto_scale(bool(checked))
+        page.refresh()
 
-    def on_channel_toggled(self, index: int, visible: bool) -> None:
-        for page in self.pages:
+    def on_channel_toggled(self, page_index: int, index: int, visible: bool) -> None:
+        if 0 <= page_index < len(self.pages):
+            page = self.pages[page_index]
             page.set_visible(index, visible)
-        self.update_plot()
+            page.refresh()
+            rows = getattr(self, "channel_rows_by_page", [])
+            if 0 <= page_index < len(rows) and index < len(rows[page_index]):
+                eye = rows[page_index][index].eye
+                eye.blockSignals(True)
+                eye.setChecked(visible)
+                eye.blockSignals(False)
+        self.update_stats(self.current_page())
 
-    def _select_channel(self, index: int) -> None:
+    def _select_channel(self, index: int, page_index: int | None = None) -> None:
         if index < 0 or index >= MAX_CHANNELS:
             return
+        if page_index is not None and 0 <= page_index < len(self.pages):
+            self._set_active_page(self.pages[page_index])
         self.selected_channel = index
-        for row in self.channel_rows:
-            row.set_selected(row.index == index and index < self.channel_count)
+        for rows in getattr(self, "channel_rows_by_page", []):
+            for row in rows:
+                row.set_selected(row.index == index and index < self.channel_count)
 
     def set_plot_paused(self, paused: bool, message: bool = True) -> None:
         paused = bool(paused)
@@ -3312,20 +3633,26 @@ class MainWindow(QMainWindow):
         return f"{value:.{digits}f}"
 
     def _update_channel_rows(self) -> None:
-        for i, row in enumerate(self.channel_rows):
-            visible = i < self.channel_count
-            row.setVisible(visible)
-            if visible:
+        groups = getattr(self, "channel_rows_by_page", [])
+        for page_index, rows in enumerate(groups):
+            page = self.pages[page_index] if page_index < len(self.pages) else None
+            for i, row in enumerate(rows):
+                visible = i < self.channel_count
+                row.setVisible(visible)
+                if not visible:
+                    continue
                 row.set_name(self.channel_names[i])
                 row.set_color(self.channel_colors[i])
                 row.set_value(self._format_value(self.last_values[i], i))
+                row.eye.blockSignals(True)
+                row.eye.setChecked(bool(page.visible[i]) if page is not None else True)
+                row.eye.blockSignals(False)
         self._update_empty_hint()
 
     def _refresh_channel_values(self) -> None:
-        if not hasattr(self, "channel_rows"):
-            return
-        for i in range(min(self.channel_count, len(self.channel_rows))):
-            self.channel_rows[i].set_value(self._format_value(self.last_values[i], i))
+        for rows in getattr(self, "channel_rows_by_page", []):
+            for i in range(min(self.channel_count, len(rows))):
+                rows[i].set_value(self._format_value(self.last_values[i], i))
 
     def _update_empty_hint(self) -> None:
         if not hasattr(self, "empty_hint"):
@@ -3354,8 +3681,8 @@ class MainWindow(QMainWindow):
             for i in range(MAX_CHANNELS):
                 page.set_channel_color(i, self.channel_colors[i])
                 page.set_channel_name(i, self.channel_names[i])
-        if hasattr(self, "channel_rows"):
-            for i, row in enumerate(self.channel_rows):
+        for rows in getattr(self, "channel_rows_by_page", []):
+            for i, row in enumerate(rows):
                 row.setVisible(False)
                 row.set_selected(False)
                 row.set_value("--")
@@ -3630,12 +3957,19 @@ class MainWindow(QMainWindow):
             item.set_preview(self._command_frame(item, silent=True).hex(" ").upper())
 
     # ================= 其它 =================
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        if hasattr(self, "page_groups"):
+            QTimer.singleShot(0, self._sync_variable_groups)
+
     def closeEvent(self, event) -> None:
         self.timer.stop()
         worker = self.worker
         self.worker = None
         if worker is not None:
             worker.stop()
+        if hasattr(self, "display_panel"):
+            self.display_panel.close_all_float_windows()
         super().closeEvent(event)
 
 
