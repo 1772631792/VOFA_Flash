@@ -303,7 +303,11 @@ vofa/
 ├── docs/screenshots/        # README 界面截图
 └── vofa/
     ├── __init__.py          # 版本号
-    ├── main_window.py       # 主窗口、三轴显示控件、多窗口与业务逻辑
+    ├── main_window.py       # 主窗口编排：数据流、多窗口、布局与业务入口
+    ├── ui/                  # 复用 UI：小控件、显示控件、对话框
+    │   ├── common.py        # 布局助手、通道行、通用小控件
+    │   ├── display.py       # 三轴显示控件与悬浮卡片
+    │   └── dialogs.py       # 变量编辑与设置对话框
     ├── command_panel.py     # 命令卡片、滑动条、组帧与组配色
     ├── plot_widget.py       # 波形页、FFT、游标、Auto、多窗口数据
     ├── protocol.py          # JustFloat 帧解析与 RawData 文本转换
