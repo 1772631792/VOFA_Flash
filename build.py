@@ -10,7 +10,6 @@ import hashlib
 import os
 import subprocess
 import sys
-import zipfile
 from pathlib import Path
 
 from vofa import __version__ as VERSION
@@ -23,7 +22,6 @@ ICON = ASSETS / "app.ico"
 DIST = ROOT / "dist"
 WORK = ROOT / "build"
 VERSION_FILE = WORK / "version_info.txt"
-RELEASE_ZIP = DIST / f"{APP_NAME}_v{VERSION}_win64.zip"
 
 # 运行期动态导入 / 按名称加载的模块，PyInstaller 静态分析看不到
 HIDDEN_IMPORTS = [
@@ -83,24 +81,9 @@ def write_version_file() -> None:
     )
 
 
-def package_release(exe: Path) -> tuple[Path, str]:
-    """生成发布 zip，并返回 (zip 路径, sha256)。"""
-    RELEASE_ZIP.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(RELEASE_ZIP, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.write(exe, arcname=exe.name)
-        readme = ROOT / "README.md"
-        if readme.exists():
-            archive.write(readme, arcname="README.md")
-        screenshots = ROOT / "docs" / "screenshots"
-        if screenshots.is_dir():
-            for image in sorted(screenshots.glob("*.png")):
-                archive.write(image, arcname=f"docs/screenshots/{image.name}")
-
-    digest = hashlib.sha256(exe.read_bytes()).hexdigest()
-    (DIST / f"{APP_NAME}_v{VERSION}_sha256.txt").write_text(
-        f"{digest}  {exe.name}\n", encoding="utf-8"
-    )
-    return RELEASE_ZIP, digest
+def sha256_of(path: Path) -> str:
+    """只计算校验值打印到控制台，不生成 txt 文件。"""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def build_command() -> list[str]:
@@ -155,10 +138,9 @@ def main() -> None:
         print("打包结束但未找到产物，请检查 PyInstaller 输出。")
         sys.exit(1)
     size_mb = exe.stat().st_size / (1024 * 1024)
-    release_zip, digest = package_release(exe)
     print(f"\n完成：{exe}（{size_mb:.1f} MB）")
-    print(f"发布包：{release_zip}")
-    print(f"SHA256：{digest}")
+    print(f"SHA256：{sha256_of(exe)}")
+    print("直接上传这个 exe 即可；不生成 zip / txt。")
     print("双击即可运行，串口驱动由系统提供，无需额外安装 Python。")
 
 

@@ -178,9 +178,6 @@ def package_release() -> tuple[Path, str]:
                 archive.write(image, arcname=f"docs/screenshots/{image.name}")
 
     digest = hashlib.sha256(RELEASE_ZIP.read_bytes()).hexdigest()
-    (DIST / f"{APP_NAME}_v{VERSION}_win64_onedir_sha256.txt").write_text(
-        f"{digest}  {RELEASE_ZIP.name}\n", encoding="utf-8"
-    )
     return RELEASE_ZIP, digest
 
 

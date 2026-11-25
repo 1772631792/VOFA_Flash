@@ -275,13 +275,11 @@ python build_fast.py  # 分开版目录：dist/VOFA_Flash/
 - 源码运行不需要打包。两种打包版都不需要目标电脑安装 Python，串口驱动由系统提供。
 - `python build.py`（单文件版）：
   - `dist/VOFA_Flash.exe`：双击即用；每次启动会解压到临时目录，适合临时分发一个文件。
-  - `dist/VOFA_Flash_v1.2.0_win64.zip`：exe + README + 截图。
-  - `dist/VOFA_Flash_v1.2.0_sha256.txt`：exe 校验值。
+  - Release 直接上传这个裸 exe，**不生成 zip / txt**；SHA256 只在打包时打印到控制台。
 - `python build_fast.py`（分开版，启动快）：
   - `dist/VOFA_Flash/VOFA_Flash.exe` + 依赖目录：不解压临时目录，冷启动更快。
   - `dist/VOFA_Flash/Create_Desktop_Shortcut.cmd`：双击后在桌面建立 `VOFA+ Flash` 快捷方式；使用 CMD + PowerShell，不生成 VBS，避免杀毒误报。
-  - `dist/VOFA_Flash_v1.2.0_win64_onedir.zip`：整个目录 + README + 截图。
-  - `dist/VOFA_Flash_v1.2.0_win64_onedir_sha256.txt`：发布包校验值。
+  - `dist/VOFA_Flash_v1.2.0_win64_onedir.zip`：整个目录 + README + 截图，Release 上传这个 zip；不生成 txt。
 - 两种 exe 文件属性中均写入版本、产品名和说明。
 - 选择建议：频繁使用 / 低配电脑用分开版；只发一个文件给别人时用单文件版。
 
