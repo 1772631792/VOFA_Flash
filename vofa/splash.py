@@ -99,7 +99,7 @@ class SplashScreen(QWidget):
         shadow_host.setStyleSheet(
             "#splashCard {"
             " background: rgba(255,255,255,232);"
-            " border: 1px solid rgba(255,255,255,245);"
+            " border: none;"
             " border-radius: 22px;"
             "}"
         )

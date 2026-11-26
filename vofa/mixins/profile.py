@@ -186,9 +186,8 @@ class ProfileMixin:
             "plot": {
                 "layout": self.plot_layout_mode,
                 "auto_scale": bool(self.current_page().auto_scale),
-                "dt_ms": self.dt_spin.value(),
-                "buffer": self.buffer_spin.value(),
-                "align": self.align_spin.value(),
+                "dt_ms": self.dt_ms,
+                "align": self.display_points,
                 "splitter": list(self.plot_splitter.sizes()),
             },
             "pages": pages,
@@ -265,23 +264,10 @@ class ProfileMixin:
                 self.apply_theme(dark)
 
             plot = data.get("plot", {})
-            for spin, key, cast in (
-                (self.dt_spin, "dt_ms", float),
-                (self.buffer_spin, "buffer", int),
-                (self.align_spin, "align", int),
-            ):
-                spin.blockSignals(True)
-                try:
-                    spin.setValue(cast(plot.get(key, spin.value())))
-                finally:
-                    spin.blockSignals(False)
-            self.dt_ms = float(self.dt_spin.value())
-            for page in self.pages:
-                page.set_dt(self.dt_ms)
-                page.set_buffer_limit(
-                    0 if self.record_unlimited else int(self.buffer_spin.value())
-                )
-                page.set_display_points(int(self.align_spin.value()))
+            self.apply_wave_settings(
+                float(plot.get("dt_ms", self.dt_ms)),
+                int(plot.get("align", self.display_points)),
+            )
 
             channels = data.get("channels", {})
             count = max(0, min(int(channels.get("count", self.channel_count)), MAX_CHANNELS))

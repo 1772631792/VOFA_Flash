@@ -34,26 +34,6 @@ class SimulationMixin:
             2500,
         )
 
-    def _sync_record_limit(self) -> None:
-        limit = 0 if self.record_unlimited else int(self.buffer_spin.value())
-        for page in self.pages:
-            page.set_buffer_limit(limit)
-        self.buffer_spin.setEnabled(not self.record_unlimited)
-
-    def apply_record_mode(self, enabled: bool) -> None:
-        self.record_unlimited = bool(enabled)
-        if hasattr(self, "record_btn"):
-            self.record_btn.blockSignals(True)
-            self.record_btn.setChecked(self.record_unlimited)
-            self.record_btn.blockSignals(False)
-        self._sync_record_limit()
-        self.statusBar().showMessage(
-            "连续记录模式已开启：一直记录，关闭软件自动清除"
-            if self.record_unlimited
-            else "连续记录模式已关闭：恢复缓冲长度限制",
-            3500,
-        )
-
     def generate_demo_data(self) -> None:
         if self.sim_mode == "pid":
             self._sync_pid_gains()

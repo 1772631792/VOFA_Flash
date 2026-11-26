@@ -32,7 +32,6 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
-    QDoubleSpinBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -68,7 +67,7 @@ from .command_panel import (
     parse_frame_bytes,
 )
 from .icons import app_icon, icon
-from .plot_widget import FFT_SCALES, FFT_WINDOWS, MAX_CHANNELS, PlotPage
+from .plot_widget import DISPLAY_POINTS, DT_MS, FFT_SCALES, FFT_WINDOWS, MAX_CHANNELS, PlotPage
 from .protocol import JustFloatParser
 from .serial_worker import SerialWorker
 from .theme import CHANNEL_COLORS, GROUP_COLORS, app_style
@@ -148,7 +147,8 @@ class MainWindow(
         self.total_frames = 0
         self.total_tx = 0
         self.sample_index = 0
-        self.dt_ms = 1.0
+        self.dt_ms = load_setting("plot/dt_ms", DT_MS, float)
+        self.display_points = load_setting("plot/display_points", DISPLAY_POINTS, int)
         self.channel_count = 0
         self.last_values = [0.0] * MAX_CHANNELS
         self.gains = [1.0] * MAX_CHANNELS
@@ -194,7 +194,6 @@ class MainWindow(
         self._group_colors: dict[str, str] = {}
 
         self.build_ui()
-        self._sync_record_limit()
         self._sync_tx_mode_ui()
         self._sync_rx_mode_ui()
         app = QApplication.instance()
@@ -440,7 +439,7 @@ class MainWindow(
         dialog.themeChanged.connect(self.apply_theme)
         dialog.shortcutsChanged.connect(self.apply_shortcuts)
         dialog.simModeChanged.connect(self.apply_sim_mode)
-        dialog.recordModeChanged.connect(self.apply_record_mode)
+        dialog.waveChanged.connect(self.apply_wave_settings)
         dialog.exec()
 
     @staticmethod
@@ -585,56 +584,6 @@ class MainWindow(
 
         self.pages: list[PlotPage] = []
 
-        # 信息栏
-        self.info_bar = QWidget()
-        info_l = hbox((10, 12, 10, 8), 8)
-        self.dt_spin = QDoubleSpinBox()
-        self.dt_spin.setRange(0.01, 10000)
-        self.dt_spin.setDecimals(2)
-        self.dt_spin.setValue(1.0)
-        self.dt_spin.setFixedWidth(78)
-        self.dt_spin.valueChanged.connect(self.on_dt_changed)
-
-        self.buffer_spin = QSpinBox()
-        self.buffer_spin.setRange(1000, 500000)
-        self.buffer_spin.setSingleStep(1000)
-        self.buffer_spin.setValue(50000)
-        self.buffer_spin.setFixedWidth(88)
-        self.buffer_spin.valueChanged.connect(self.on_buffer_changed)
-
-        self.align_spin = QSpinBox()
-        self.align_spin.setRange(100, 10000)
-        self.align_spin.setValue(1200)
-        self.align_spin.setFixedWidth(80)
-        self.align_spin.valueChanged.connect(self.on_align_changed)
-        for spin in (self.dt_spin, self.buffer_spin, self.align_spin):
-            spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
-
-        info_l.addWidget(make_label("Δt:", "sectionBlue"))
-        info_l.addWidget(self.dt_spin)
-        info_l.addWidget(make_label("ms"))
-        info_l.addSpacing(10)
-        info_l.addWidget(make_label("缓冲:", "sectionBlue"))
-        info_l.addWidget(self.buffer_spin)
-        info_l.addWidget(make_label("/ch"))
-        info_l.addSpacing(10)
-        info_l.addWidget(make_label("点数:", "sectionBlue"))
-        info_l.addWidget(self.align_spin)
-        info_l.addStretch(1)
-
-        self.auto_label = QPushButton("Auto")
-        self.auto_label.setObjectName("autoBtn")
-        self.auto_label.setFixedSize(84, 32)
-        self.auto_label.setCheckable(True)
-        self.auto_label.setChecked(True)
-        self.auto_label.setToolTip(
-            "Auto：自动适配 X/Y 轴范围（滚轮缩放只改宽度仍跟随，拖动冻结，双击波形恢复）"
-        )
-        self.auto_label.toggled.connect(self.toggle_auto_scale)
-        info_l.addWidget(self.auto_label)
-        self.info_bar.setLayout(info_l)
-        plot_l.addWidget(self.info_bar)
-
         # 统计栏
         self.stat_bar = QWidget()
         stat_l = hbox((10, 2, 10, 6), 14)
@@ -707,6 +656,17 @@ class MainWindow(
         self.img_btn.setToolTip("导出曲线图片（PNG）")
         self.img_btn.clicked.connect(self.save_screenshot)
         stat_l.addWidget(self.img_btn)
+
+        self.auto_label = QPushButton("Auto")
+        self.auto_label.setObjectName("autoBtn")
+        self.auto_label.setFixedSize(84, 32)
+        self.auto_label.setCheckable(True)
+        self.auto_label.setChecked(True)
+        self.auto_label.setToolTip(
+            "Auto：自动适配 X/Y 轴范围（滚轮缩放只改宽度仍跟随，拖动冻结，双击波形恢复）"
+        )
+        self.auto_label.toggled.connect(self.toggle_auto_scale)
+        stat_l.addWidget(self.auto_label, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self.stat_bar.setLayout(stat_l)
         plot_l.addWidget(self.stat_bar)
@@ -851,9 +811,11 @@ class MainWindow(
         tx_line.addWidget(self.tx_mode_btn)
         tx_line.addWidget(make_label("➜"))
 
+        self.tx_big_endian = bool(load_setting("serial/tx_big_endian", False, bool))
         self.tx_edit = QLineEdit("01 03 00 00 00 01 84 0A")
-        self.tx_edit.setPlaceholderText("输入要发送的数据，回车发送")
+        self._update_tx_edit_hint()
         self.tx_edit.returnPressed.connect(self.send_from_edit)
+        self.tx_edit.installEventFilter(self)
         tx_line.addWidget(self.tx_edit, 1)
 
         self.ending_combo = QComboBox()

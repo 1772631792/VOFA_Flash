@@ -13,6 +13,7 @@ from ..transport import TcpClientTransport
 from ..transport import TcpServerTransport
 from ..transport import UdpTransport
 from ..settings import save_setting
+from ..format_cmd import format_command_help, is_format_command, parse_format_command
 
 
 class TransportMixin:
@@ -427,14 +428,21 @@ class TransportMixin:
     def send_text(self, text: str) -> None:
         if not text.strip():
             return
+        is_format = is_format_command(text)
         try:
-            if self.hex_mode:
+            if is_format:
+                payload = parse_format_command(
+                    text, self.encoding, bool(getattr(self, "tx_big_endian", False))
+                )
+            elif self.hex_mode:
                 payload = bytes.fromhex(text.replace(" ", "").replace(",", ""))
             else:
                 payload = text.encode(self.encoding, errors="replace")
-        except ValueError:
+        except ValueError as exc:
             QMessageBox.warning(
-                self, "发送格式错误", "当前为 Hex 模式，请输入正确的十六进制字节串。"
+                self,
+                "发送格式错误",
+                str(exc) if is_format else "当前为 Hex 模式，请输入正确的十六进制字节串。",
             )
             return
 
@@ -448,11 +456,11 @@ class TransportMixin:
             if not self.worker.send(payload):
                 QMessageBox.information(self, "发送失败", "接口尚未就绪，请检查连接")
                 return
-            shown = payload.hex(" ").upper() if self.hex_mode else text
+            shown = payload.hex(" ").upper() if (self.hex_mode or is_format) else text
             self.log_rx("[tx] " + shown, kind="tx")
             self.statusBar().showMessage(f"已发送 {len(payload)} 字节", 3000)
         else:
-            shown = payload.hex(" ").upper() if self.hex_mode else text
+            shown = payload.hex(" ").upper() if (self.hex_mode or is_format) else text
             self.log_rx("[tx] " + shown, kind="tx")
             self.statusBar().showMessage(
                 f"模拟模式已发出 {len(payload)} 字节（仅回显，接串口后真实下发）", 3000

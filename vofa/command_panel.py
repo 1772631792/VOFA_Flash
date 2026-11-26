@@ -908,13 +908,25 @@ class CommandDialog(QDialog):
         fixed_lay.setSpacing(6)
         self.content_edit = QLineEdit(settings.get("content", ""))
         self.content_edit.setObjectName("mono")
-        self.content_edit.setPlaceholderText('01 03 00 00 00 01 84 0A  或  text:AT+RESET\\r\\n')
+        self.content_edit.setPlaceholderText(
+            '01 03 00 00 00 01 84 0A  或  text:AT+RESET\\r\\n  或  S%fE,1.31'
+        )
+        self.content_edit.installEventFilter(self)
+        self.content_edit.setToolTip("双击切换大端 / 小端（默认小端）")
         fixed_lay.addLayout(self._row("内容", self.content_edit))
+        self.fixed_endian_combo = QComboBox()
+        self.fixed_endian_combo.addItems(["小端 (LE)", "大端 (BE)"])
+        self.fixed_endian_combo.setCurrentIndex(1 if settings.get("big_endian") else 0)
+        self.fixed_endian_combo.setToolTip("格式串（如 S%fE,1.31）里的数值按此字节序打包")
+        fixed_lay.addLayout(self._row("字节序", self.fixed_endian_combo))
         hint = _label(
-            "内容可以直接写 Hex（AA 55），也可以直接写文本（text:AT+RESET\\r\\n 或 "
-            '加引号 "hello"）：全是十六进制字符按 Hex 发送，其它按当前编码发送。'
+            "内容可以直接写 Hex（AA 55）、文本（text:AT+RESET\\r\\n 或 "
+            '加引号 "hello"），也可以用格式串 S%fE,1.31 自动打包数值；'
+            "全是十六进制字符按 Hex 发送，其它按当前编码发送，格式串数值按上面的字节序打包；"
+            "双击内容框可直接切换大端 / 小端。"
             if hex_mode
-            else "当前为文本模式，内容按所选编码发送；也可以写 hex: 前缀强制按十六进制发送。",
+            else "当前为文本模式，内容按所选编码发送；可写 hex: 前缀强制按十六进制发送，"
+            "也可以用格式串 S%fE,1.31 自动打包数值（按上面的字节序）；双击内容框可直接切换大端 / 小端。",
             "tinyMuted",
         )
         hint.setWordWrap(True)
@@ -1057,6 +1069,16 @@ class CommandDialog(QDialog):
         self.kind_combo.currentIndexChanged.connect(self._sync_kind)
         self._sync_kind()
 
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        if (
+            obj is getattr(self, "content_edit", None)
+            and event.type() == QEvent.Type.MouseButtonDblClick
+        ):
+            index = self.fixed_endian_combo.currentIndex()
+            self.fixed_endian_combo.setCurrentIndex(0 if index == 1 else 1)
+            return True
+        return super().eventFilter(obj, event)
+
     # ---- 小工具 ----
     @staticmethod
     def _row(text: str, widget: QWidget) -> QHBoxLayout:
@@ -1132,7 +1154,11 @@ class CommandDialog(QDialog):
             "title": self.name_edit.text().strip(),
             "content": self.content_edit.text(),
             "dtype": self.dtype_combo.currentText(),
-            "big_endian": self.endian_combo.currentIndex() == 1,
+            "big_endian": (
+                self.endian_combo.currentIndex() == 1
+                if slider
+                else self.fixed_endian_combo.currentIndex() == 1
+            ),
             "vmin": self.min_spin.value(),
             "vmax": self.max_spin.value(),
             "step": self.step_spin.value(),

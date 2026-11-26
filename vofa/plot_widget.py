@@ -32,6 +32,8 @@ def _font(family: str, size: int, bold: bool = False) -> QFont:
 
 
 MAX_CHANNELS = 8
+DT_MS = 1.0
+DISPLAY_POINTS = 1200
 Y_SMOOTH = 0.45
 
 FFT_WINDOWS = {
@@ -322,13 +324,11 @@ class PlotPage(pg.PlotWidget):
         self.channel_names = [f"I{i}" for i in range(MAX_CHANNELS)]
         self.visible = [True] * MAX_CHANNELS
         self.buffers: list[deque[float]] = [
-            deque(maxlen=50000) for _ in range(MAX_CHANNELS)
+            deque() for _ in range(MAX_CHANNELS)
         ]
-        self.times: deque[float] = deque(maxlen=50000)
-        self.buffer_limit = 50000
-        self.unlimited = False
-        self.display_points = 1200
-        self.dt_ms = 1.0
+        self.times: deque[float] = deque()
+        self.display_points = DISPLAY_POINTS
+        self.dt_ms = DT_MS
         self.sample_index = 0
         self.has_data = False
         self.auto_scale = True
@@ -443,16 +443,6 @@ class PlotPage(pg.PlotWidget):
 
     def set_dt(self, dt_ms: float) -> None:
         self.dt_ms = max(0.001, float(dt_ms))
-
-    def set_buffer_limit(self, limit: int) -> None:
-        """limit <= 0 表示不限长度（连续记录模式）。"""
-        limit = int(limit)
-        maxlen = None if limit <= 0 else max(1000, limit)
-        self.buffer_limit = limit
-        self.unlimited = limit <= 0
-        self.times = deque(self.times, maxlen=maxlen)
-        for i in range(MAX_CHANNELS):
-            self.buffers[i] = deque(self.buffers[i], maxlen=maxlen)
 
     def set_display_points(self, points: int) -> None:
         self.display_points = max(100, int(points))
@@ -586,39 +576,38 @@ class PlotPage(pg.PlotWidget):
             self._hide_diff_lines()
             self.fft_summary.hide()
             self._place_watermark()
+            self._last_draw_fingerprint = None
             return
 
-        if self.unlimited and n > self.display_points:
-            # 连续记录：画完整历史，点数过多时等间隔抽样保证流畅
-            max_points = max(20000, self.display_points * 4)
-            stride = max(1, n // max_points)
-            all_times = np.fromiter(self.times, dtype=float, count=n)
-            times = all_times[::stride]
-            if times[-1] != all_times[-1]:
-                times = np.append(times, all_times[-1])
-        else:
-            shown = min(self.display_points, n)
-            times = np.fromiter(
-                islice(reversed(self.times), 0, shown), dtype=float, count=shown
-            )[::-1]
-        x = times - times[0]
-        self._x_base_ms = float(times[0])
+        # 指纹：数据点数 + 最新时间 + 可见通道/模式，无变化则跳过整段重算
+        fingerprint = (
+            n, self.times[-1] if self.times else None,
+            tuple(self.visible[: self.channel_count]), self.channel_count,
+            self.plot_mode, self.follow_latest, self._follow_span_ms,
+        )
+        if fingerprint == getattr(self, "_last_draw_fingerprint", None):
+            return
+        self._last_draw_fingerprint = fingerprint
+
+        # 画完整历史，点数过多时等间隔抽样保证流畅（视图缩放后曲线仍能铺满）
+        max_points = max(20000, self.display_points * 4)
+        stride = max(1, n // max_points)
+        all_times = np.fromiter(self.times, dtype=float, count=n)
+        time_arr = all_times[::stride]
+        if time_arr[-1] != all_times[-1]:
+            time_arr = np.append(time_arr, all_times[-1])
+        x = time_arr - time_arr[0]
+        self._x_base_ms = float(time_arr[0])
 
         arrays: list[np.ndarray | None] = [None] * MAX_CHANNELS
         for i in range(MAX_CHANNELS):
             buf = self.buffers[i]
             if i < self.channel_count and self.visible[i] and len(buf) >= n:
-                if self.unlimited and n > self.display_points:
-                    all_values = np.fromiter(buf, dtype=float, count=n)
-                    values = all_values[::stride]
-                    if len(values) < len(times):
-                        values = np.append(values, all_values[-1])
-                    arrays[i] = values
-                else:
-                    shown = min(self.display_points, n)
-                    arrays[i] = np.fromiter(
-                        islice(reversed(buf), 0, shown), dtype=float, count=shown
-                    )[::-1]
+                all_values = np.fromiter(buf, dtype=float, count=n)
+                values = all_values[::stride]
+                if len(values) < len(time_arr):
+                    values = np.append(values, all_values[-1])
+                arrays[i] = values
                 self._filled[i] = True
             else:
                 self._filled[i] = False
@@ -708,10 +697,10 @@ class PlotPage(pg.PlotWidget):
     def _fit_view(self, x: np.ndarray, arrays: list[np.ndarray]) -> None:
         """Auto：X 跟随最近一个显示窗口，Y 贴合可见数据并留 8% 边距。
 
-        连续记录模式仍保留/绘制完整历史，但视图只跟随最近 display_points
+        曲线保留/绘制完整历史，但视图只跟随最近 DISPLAY_POINTS
         个采样点对应的时间窗（类似 VOFA+ 的滚动跟随），不会把全部历史塞进视野。
         """
-        if self.unlimited and x.size > self.display_points:
+        if x.size > self.display_points:
             x0 = float(x[-self.display_points])
         else:
             x0 = float(x[0])
@@ -1064,7 +1053,12 @@ class PlotPage(pg.PlotWidget):
 
     def mouseDoubleClickEvent(self, ev) -> None:
         if ev.button() == Qt.LeftButton:
-            self.set_auto_scale(True)
+            self.auto_scale = True
+            self.follow_latest = True
+            self._follow_span_ms = None
+            self._last_manual_span = None
+            self._y_range = None
+            self.refresh()
             self.autoScaleRequested.emit(True)
             ev.accept()
             return

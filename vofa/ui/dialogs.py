@@ -8,7 +8,6 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
-    QCheckBox,
     QComboBox,
     QDialog,
     QDoubleSpinBox,
@@ -196,7 +195,7 @@ class SettingsDialog(QDialog):
     themeChanged = Signal(bool)
     shortcutsChanged = Signal(dict)
     simModeChanged = Signal(int)
-    recordModeChanged = Signal(bool)
+    waveChanged = Signal(float, int)
 
     def __init__(self, window: "MainWindow", parent=None):
         super().__init__(parent)
@@ -212,7 +211,7 @@ class SettingsDialog(QDialog):
         tabs.addTab(self._shortcut_tab(window), "快捷键")
         tabs.addTab(self._layout_tab(), "布局")
         tabs.addTab(self._sim_tab(window.sim_mode), "模拟")
-        tabs.addTab(self._record_tab(window.record_unlimited), "记录")
+        tabs.addTab(self._wave_tab(window), "波形")
         root.addWidget(tabs, 1)
 
         buttons = hbox(spacing=8)
@@ -247,21 +246,46 @@ class SettingsDialog(QDialog):
         page.setLayout(lay)
         return page
 
-    def _record_tab(self, enabled: bool) -> QWidget:
+    def _wave_tab(self, window: "MainWindow") -> QWidget:
         page = QWidget()
         lay = vbox((18, 18, 18, 14), 10)
-        lay.addWidget(make_label("连续记录模式", "sectionBlue"))
-        self.record_check = QCheckBox("不限缓冲长度，一直记录全部数据")
-        self.record_check.setChecked(bool(enabled))
-        self.record_check.setToolTip("开启后不再按缓冲长度覆盖旧数据")
-        lay.addWidget(self.record_check)
-        lay.addWidget(
-            make_label(
-                "适合长时间观察曲线变化，历史数据不会被覆盖；\n"
-                "关闭软件时会自动清除这些记录，不会保存到磁盘。",
-                "tinyMuted",
-            )
+        lay.addWidget(make_label("波形参数", "sectionBlue"))
+
+        self.dt_spin = QDoubleSpinBox()
+        self.dt_spin.setRange(0.01, 10000)
+        self.dt_spin.setDecimals(2)
+        self.dt_spin.setValue(float(window.dt_ms))
+        self.dt_spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        self.dt_spin.setToolTip("两个采样点之间的时间间隔，影响时间轴与模拟数据步长")
+        dt_row = hbox(spacing=10)
+        dt_label = make_label("采样间隔 Δt")
+        dt_label.setFixedWidth(96)
+        dt_row.addWidget(dt_label)
+        dt_row.addWidget(self.dt_spin)
+        dt_row.addWidget(make_label("ms"))
+        dt_row.addStretch(1)
+        lay.addLayout(dt_row)
+
+        self.points_spin = QSpinBox()
+        self.points_spin.setRange(100, 10000)
+        self.points_spin.setValue(int(window.display_points))
+        self.points_spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        self.points_spin.setToolTip("Auto 视图跟随的采样点数，曲线仍绘制完整历史")
+        points_row = hbox(spacing=10)
+        points_label = make_label("视窗点数")
+        points_label.setFixedWidth(96)
+        points_row.addWidget(points_label)
+        points_row.addWidget(self.points_spin)
+        points_row.addStretch(1)
+        lay.addLayout(points_row)
+
+        hint = make_label(
+            "Δt 决定时间轴刻度与模拟数据步长；视窗点数只影响 Auto 跟随范围。\n"
+            "波形始终保留完整历史，不限制缓冲长度。",
+            "tinyMuted",
         )
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
         lay.addStretch(1)
         page.setLayout(lay)
         return page
@@ -373,7 +397,7 @@ class SettingsDialog(QDialog):
             return
         self.shortcutsChanged.emit(mapping)
         self.simModeChanged.emit(self.sim_combo.currentIndex())
-        self.recordModeChanged.emit(self.record_check.isChecked())
+        self.waveChanged.emit(self.dt_spin.value(), self.points_spin.value())
         self.accept()
 
     def _export_layout_dialog(self) -> None:

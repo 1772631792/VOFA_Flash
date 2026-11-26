@@ -275,10 +275,14 @@ class SignalsMixin:
             for target in self.pages:
                 if target.isVisible():
                     target.refresh()
-        self.update_stats(page)
-        self._refresh_channel_values()
-        if hasattr(self, "display_panel"):
-            self.display_panel.refresh_from_data()
+        # 统计栏/通道数值限频到 10Hz，避免每帧 QLabel 重排拖慢 UI
+        now = time.monotonic()
+        if now - getattr(self, "_last_ui_refresh", 0.0) >= 0.1:
+            self._last_ui_refresh = now
+            self.update_stats(page)
+            self._refresh_channel_values()
+            if hasattr(self, "display_panel"):
+                self.display_panel.refresh_from_data()
         self._update_throughput()
 
     def _update_throughput(self) -> None:

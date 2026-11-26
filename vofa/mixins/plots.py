@@ -24,6 +24,7 @@ from ..plot_widget import MAX_CHANNELS
 from ..ui.measure import MeasureDialog
 from ..plot_widget import PlotPage
 from ..ui.dialogs import VariableDialog
+from ..settings import save_setting
 
 
 class PlotsMixin:
@@ -60,6 +61,8 @@ class PlotsMixin:
 
     def _create_page(self) -> None:
         page = PlotPage(dark=self.dark)
+        page.set_dt(self.dt_ms)
+        page.set_display_points(self.display_points)
         page.set_channel_count(self.channel_count)
         page.set_auto_scale(True)
         for index in range(MAX_CHANNELS):
@@ -79,6 +82,20 @@ class PlotsMixin:
         self.plot_splitter.addWidget(page)
         if self.active_page is None:
             self.active_page = page
+
+    def apply_wave_settings(self, dt_ms: float, points: int) -> None:
+        """应用设置里的 Δt 与视窗点数，并持久化，下次启动继续生效。"""
+        self.dt_ms = max(0.001, float(dt_ms))
+        self.display_points = max(100, int(points))
+        for page in self.pages:
+            page.set_dt(self.dt_ms)
+            page.set_display_points(self.display_points)
+            page.refresh()
+        save_setting("plot/dt_ms", self.dt_ms)
+        save_setting("plot/display_points", self.display_points)
+        self.statusBar().showMessage(
+            f"波形参数已更新：Δt {self.dt_ms:g} ms，视窗 {self.display_points} 点", 2500
+        )
 
     def _show_plot_menu_at(self, page: PlotPage, global_pos) -> None:
         """波形区右键菜单：所有操作只作用于被右键的窗口。"""
@@ -285,20 +302,6 @@ class PlotsMixin:
             self.measure_dialog.activateWindow()
         self.measure_dialog.show()
 
-    def on_dt_changed(self, value: float) -> None:
-        self.dt_ms = float(value)
-        for page in self.pages:
-            page.set_dt(self.dt_ms)
-
-    def on_buffer_changed(self, value: int) -> None:
-        for page in self.pages:
-            page.set_buffer_limit(value)
-        self.statusBar().showMessage(f"缓冲区上限 {value}/ch", 2000)
-
-    def on_align_changed(self, value: int) -> None:
-        for page in self.pages:
-            page.set_display_points(value)
-
     def _on_page_auto_requested(self, page: PlotPage, enabled: bool) -> None:
         self._sync_auto_label_from_page(page)
 
@@ -424,7 +427,30 @@ class PlotsMixin:
             f"请点击波形设置游标 {'AB'[index]}", 2500
         )
 
+    def _update_tx_edit_hint(self) -> None:
+        if not hasattr(self, "tx_edit"):
+            return
+        endian = "大端 BE" if getattr(self, "tx_big_endian", False) else "小端 LE"
+        self.tx_edit.setToolTip(
+            f"格式串：S%fE,1.31 → 头S + float32(1.31) + 尾E；"
+            f"%f/%d/%u/%h/%H/%b/%B/%q/%Q/%l；双击切换大小端（当前 {endian}）"
+        )
+        self.tx_edit.setPlaceholderText(
+            f"十六进制 / 文本 / 格式串（双击切大小端，当前 {endian}）"
+        )
+
+    def _toggle_tx_endian(self) -> None:
+        self.tx_big_endian = not getattr(self, "tx_big_endian", False)
+        save_setting("serial/tx_big_endian", self.tx_big_endian)
+        self._update_tx_edit_hint()
+        self.statusBar().showMessage(
+            f"格式串字节序已切换为 {'大端 BE' if self.tx_big_endian else '小端 LE'}", 2500
+        )
+
     def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        if obj is getattr(self, "tx_edit", None) and event.type() == QEvent.Type.MouseButtonDblClick:
+            self._toggle_tx_endian()
+            return True
         if (
             event.type() == QEvent.Type.KeyPress
             and not self._is_text_input(obj)

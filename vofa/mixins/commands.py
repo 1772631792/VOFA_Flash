@@ -17,6 +17,8 @@ from ..theme import GROUP_COLORS
 from ..command_panel import crc_bytes
 from ..command_panel import dtype_limits
 from ..command_panel import parse_frame_bytes
+from ..format_cmd import is_format_command
+from ..format_cmd import parse_format_command
 
 
 class CommandsMixin:
@@ -283,7 +285,9 @@ class CommandsMixin:
         """按“头帧 + 数据 + 尾帧”拼出一帧；滑动条按组一起打包。"""
         try:
             if item.kind == "fixed":
-                body = self._encode_command_content(item.content, silent)
+                body = self._encode_command_content(
+                    item.content, silent, getattr(item, "big_endian", False)
+                )
                 if body is None:
                     return b""
                 return (
@@ -306,23 +310,23 @@ class CommandsMixin:
                 )
             return b""
 
-    def _encode_command_content(self, text: str, silent: bool = False) -> bytes | None:
+    def _encode_command_content(
+        self, text: str, silent: bool = False, big_endian: bool = False
+    ) -> bytes | None:
         if not text.strip():
             return b""
         stripped = text.strip()
-        forced_hex = stripped.lower().startswith(("hex:", "x:"))
         try:
+            if is_format_command(stripped):
+                return parse_format_command(stripped, self.encoding, big_endian)
+            forced_hex = stripped.lower().startswith(("hex:", "x:"))
             if self.hex_mode or forced_hex:
                 # Hex 模式也支持直接写文本：出现非十六进制字符时按文本编码发送
                 return parse_frame_bytes(stripped, self.encoding)
             return text.encode(self.encoding, errors="replace")
-        except ValueError:
+        except ValueError as exc:
             if not silent:
-                QMessageBox.warning(
-                    self,
-                    "命令格式错误",
-                    "hex: 前缀的十六进制位数需为偶数；普通内容可直接写 Hex（AA 55）或文本。",
-                )
+                QMessageBox.warning(self, "命令格式错误", str(exc))
             return None
 
     def _refresh_command_previews(self) -> None:
