@@ -4,8 +4,8 @@
 - 纯白画布 + 极浅网格 + 细描边 + Consolas 刻度，摆脱 pyqtgraph 默认的灰黑配色。
 - 右上角半透明图例，随通道名称 / 颜色 / 可见性实时刷新。
 - 暂停后鼠标移入显示十字游标和数值读数面板（含相对时间），运行中保持画布干净。
-- Auto 打开时同时自适应 X（跟随最新数据窗口）与 Y（可见数据加边距）；
-  手动滚轮缩放或拖动会自动关闭 Auto，避免"Auto 抢拖动"，也让 Auto 按钮确实有反馈。
+- 默认自动跟随：X 跟随最新数据窗口（连续记录时只跟随最近一段）、Y 贴合可见数据；
+  滚轮缩放只改窗口宽度并继续跟随，拖动平移才冻结视图，双击波形恢复跟随。
 """
 
 from __future__ import annotations
@@ -285,15 +285,15 @@ class PlotPage(pg.PlotWidget):
             angle=90,
             movable=True,
             pen=pg.mkPen(pal["diff_a"], width=2.4),
-            label="A",
-            labelOpts={"position": 0.03},
+            label="▼A",
+            labelOpts={"position": 0.97, "anchors": (0.5, 1.0)},
         )
         self._diff_b_line = pg.InfiniteLine(
             angle=90,
             movable=True,
             pen=pg.mkPen(pal["diff_b"], width=2.4, style=Qt.PenStyle.DashLine),
-            label="B",
-            labelOpts={"position": 0.03},
+            label="▼B",
+            labelOpts={"position": 0.97, "anchors": (0.5, 1.0)},
         )
         for index, line in enumerate((self._diff_a_line, self._diff_b_line)):
             line.setZValue(41)
@@ -304,6 +304,7 @@ class PlotPage(pg.PlotWidget):
             plot.addItem(line, ignoreBounds=True)
         self.diff_mode = False
         self._diff_times: list[float | None] = [None, None]
+        self._pending_cursor: int | None = None  # 按 A/B 后等待点击放置
         self._x_base_ms = 0.0
 
         self._readout = QLabel(self.viewport())
@@ -331,6 +332,10 @@ class PlotPage(pg.PlotWidget):
         self.sample_index = 0
         self.has_data = False
         self.auto_scale = True
+        # 滚轮缩放后仍保持 X 跟随最新数据；仅拖动/平移才解冻视图
+        self.follow_latest = True
+        self._follow_span_ms: float | None = None  # 缩窗后的时间宽度
+        self._last_manual_span: float | None = None
         self.inspect_mode = False
         self._next_cursor = 0
         self.plot_mode = "time"
@@ -476,18 +481,13 @@ class PlotPage(pg.PlotWidget):
             self._legend_key = None
 
     def set_inspect_mode(self, enabled: bool) -> None:
-        """暂停即进入测量模式：显示两条可拖动游标；运行时彻底隐藏。"""
+        """暂停即进入检查模式：可用十字读数，但默认不显示游标；运行时彻底隐藏。"""
         enabled = bool(enabled)
         if self.inspect_mode == enabled:
             return
         self.inspect_mode = enabled
         if enabled:
             self._readout.raise_()
-            self.diff_mode = True
-            if self._diff_times[0] is None or self._diff_times[1] is None:
-                first, last = self._visible_time_bounds()
-                self._diff_times = [first, last]
-            self.refresh()
         else:
             self.set_diff_mode(False)
 
@@ -550,10 +550,22 @@ class PlotPage(pg.PlotWidget):
         self.auto_scale = enabled
         self._y_range = None
         if enabled:
+            self.follow_latest = True
+            self._follow_span_ms = None
+            self._last_manual_span = None
             self.refresh()
 
     def _on_manual_range(self, *_args) -> None:
-        """用户滚轮缩放 / 拖动后自动退出 Auto，把视图控制权交回用户。"""
+        """滚轮缩放只改窗口宽度、继续跟随；拖动平移才真正解冻 X 视图。"""
+        (x0, x1), _ = self.getPlotItem().getViewBox().viewRange()
+        span = x1 - x0
+        is_zoom = self._last_manual_span is None or abs(span - self._last_manual_span) > 1e-6
+        self._last_manual_span = span
+        if is_zoom:
+            self._follow_span_ms = span
+            self.follow_latest = True
+        else:
+            self.follow_latest = False
         if self.auto_scale:
             self.auto_scale = False
             self._y_range = None
@@ -628,6 +640,10 @@ class PlotPage(pg.PlotWidget):
             self.fft_summary.hide()
             if self.auto_scale:
                 self._fit_view(x, [a for a in arrays if a is not None])
+            elif self.follow_latest and self._follow_span_ms and x.size:
+                # 滚轮缩放后：保持用户设定的窗口宽度，右边缘继续跟随最新数据
+                x1 = float(x[-1])
+                self.setXRange(x1 - self._follow_span_ms, x1, padding=0.0)
             if self.diff_mode:
                 self._update_diff_readout()
 
@@ -836,15 +852,54 @@ class PlotPage(pg.PlotWidget):
         self.diff_mode = bool(enabled)
         if self.diff_mode:
             self._hide_cursor_readout()
-            if self._diff_times[0] is None or self._diff_times[1] is None:
-                first, last = self._visible_time_bounds()
-                self._diff_times = [first, last]
             self._update_diff_readout()
         else:
             self._diff_times = [None, None]
+            self._pending_cursor = None
             self._hide_diff_lines()
             self.diffMeasured.emit({"active": False, "a": None, "b": None})
         self.update()
+
+    def set_cursor_defaults(self) -> None:
+        """C 键且从未设过游标时：A 放可见区左侧、B 放右侧固定位置。"""
+        first, last = self._visible_time_bounds()
+        if first is None or last is None:
+            return
+        span = last - first
+        self._diff_times = [first + span * 0.15, first + span * 0.85]
+        self._pending_cursor = None
+        if not self.diff_mode:
+            self.set_diff_mode(True)
+        self._update_diff_readout()
+
+    def begin_cursor_placement(self, index: int) -> None:
+        """按 A/B 后进入等待点击放置状态（游标暂不出现）。"""
+        if index not in (0, 1):
+            return
+        self._pending_cursor = index
+        if not self.diff_mode:
+            self.diff_mode = True
+            self._hide_cursor_readout()
+            self._update_diff_readout()
+
+    def cursor_time_at_mouse(self) -> float | None:
+        """鼠标所在位置对应的绝对时间（毫秒）；不在画布内返回 None。"""
+        if self._last_mouse is None or self._x is None:
+            return None
+        vb = self.getPlotItem().getViewBox()
+        scene_pos = self.mapToScene(self._last_mouse.toPoint())
+        if not vb.sceneBoundingRect().contains(scene_pos):
+            return None
+        return float(vb.mapSceneToView(scene_pos).x()) + self._x_base_ms
+
+    def set_cursor_at(self, index: int, abs_ms: float) -> None:
+        """把 A(index=0) / B(index=1) 游标放到指定时间，并自动显示游标。"""
+        if index not in (0, 1):
+            return
+        if not self.diff_mode:
+            self.set_diff_mode(True)
+        self._diff_times[index] = float(abs_ms)
+        self._update_diff_readout()
 
     def _hide_diff_lines(self) -> None:
         if not hasattr(self, "_diff_a_line"):
@@ -984,7 +1039,9 @@ class PlotPage(pg.PlotWidget):
                 scene_pos = self.mapToScene(ev.position().toPoint())
                 view_pos = vb.mapSceneToView(scene_pos)
                 abs_ms = float(view_pos.x()) + self._x_base_ms
-                self._diff_times[self._next_cursor] = abs_ms
+                index = self._pending_cursor if self._pending_cursor is not None else self._next_cursor
+                self._diff_times[index] = abs_ms
+                self._pending_cursor = None
                 self._next_cursor = 1 - self._next_cursor
                 self._update_diff_readout()
             except (AttributeError, TypeError, ValueError):
@@ -1007,10 +1064,8 @@ class PlotPage(pg.PlotWidget):
 
     def mouseDoubleClickEvent(self, ev) -> None:
         if ev.button() == Qt.LeftButton:
-            self._y_range = None
-            self.auto_scale = True
+            self.set_auto_scale(True)
             self.autoScaleRequested.emit(True)
-            self.refresh()
             ev.accept()
             return
         super().mouseDoubleClickEvent(ev)

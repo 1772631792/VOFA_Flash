@@ -28,6 +28,9 @@ SHORTCUT_DEFAULTS = {
     "screenshot": "Ctrl+S",
     "export_csv": "Ctrl+E",
     "clear_plot": "Ctrl+L",
+    "cursor_a": "A",
+    "cursor_b": "B",
+    "cursor_toggle": "C",
 }
 SHORTCUT_LABELS = {
     "pause": "暂停 / 继续波形",
@@ -35,6 +38,9 @@ SHORTCUT_LABELS = {
     "screenshot": "导出截图 PNG",
     "export_csv": "导出数据 CSV",
     "clear_plot": "清空波形",
+    "cursor_a": "设游标 A（暂停且鼠标在波形内时）",
+    "cursor_b": "设游标 B（暂停且鼠标在波形内时）",
+    "cursor_toggle": "显示 / 隐藏游标（暂停且鼠标在波形内时）",
 }
 
 
