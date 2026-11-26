@@ -10,10 +10,17 @@
 
 from __future__ import annotations
 
+import sys
+
+if __package__ in (None, ""):
+    print("请用项目根目录的 main.py 启动：python main.py（不要直接运行子模块）")
+    sys.exit(1)
+
 import math
 import re
 import struct
 import time
+import zlib
 
 from PySide6.QtCore import QEvent, QPoint, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
@@ -50,6 +57,36 @@ _FMT: dict[str, tuple[str, int]] = {
     "uint8": ("B", 1),
 }
 DTYPE_NAMES = list(_FMT)
+
+# CRC 类型 -> (显示名, 校验字节数)
+CRC_MODES: dict[str, tuple[str, int]] = {
+    "none": ("无", 0),
+    "crc8": ("CRC-8", 1),
+    "crc16": ("CRC-16/Modbus", 2),
+    "crc32": ("CRC-32", 4),
+}
+CRC_NAMES = [label for label, _ in CRC_MODES.values()]
+
+
+def crc_bytes(mode: str, data: bytes) -> bytes:
+    """按模式计算 CRC；CRC-16 使用 Modbus 约定（多项式 A001，低字节在前）。"""
+    if mode == "crc8":
+        crc = 0
+        for byte in data:
+            crc ^= byte
+            for _ in range(8):
+                crc = ((crc << 1) ^ 0x07) & 0xFF if crc & 0x80 else (crc << 1) & 0xFF
+        return bytes((crc,))
+    if mode == "crc16":
+        crc = 0xFFFF
+        for byte in data:
+            crc ^= byte
+            for _ in range(8):
+                crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
+        return crc.to_bytes(2, "little")
+    if mode == "crc32":
+        return zlib.crc32(data).to_bytes(4, "little")
+    return b""
 
 
 def dtype_size(dtype: str) -> int:
@@ -387,6 +424,7 @@ class CommandItem(QFrame):
         self.head_text = ""
         self.tail_enabled = False
         self.tail_text = ""
+        self.crc = "none"
         self.auto_send = True
 
         self.slider: AdaptiveSlider | None = None
@@ -431,6 +469,7 @@ class CommandItem(QFrame):
             "head_text": self.head_text,
             "tail_enabled": self.tail_enabled,
             "tail_text": self.tail_text,
+            "crc": self.crc,
             "auto_send": self.auto_send,
         }
 
@@ -450,6 +489,8 @@ class CommandItem(QFrame):
         self.head_text = data.get("head_text", self.head_text)
         self.tail_enabled = bool(data.get("tail_enabled", self.tail_enabled))
         self.tail_text = data.get("tail_text", self.tail_text)
+        crc = str(data.get("crc", self.crc) or "none")
+        self.crc = crc if crc in CRC_MODES else "none"
         self.auto_send = bool(data.get("auto_send", self.auto_send))
         self.refresh()
 
@@ -525,6 +566,11 @@ class CommandItem(QFrame):
             self.badge.rightClicked.connect(self._show_group_color_menu)
             top.addWidget(self.badge)
             top.addSpacing(4)
+            if self.crc != "none":
+                crc_badge = _label(CRC_MODES[self.crc][0], "versionPill")
+                crc_badge.setToolTip("自建滑动组：发送前自动追加校验字节")
+                top.addWidget(crc_badge)
+                top.addSpacing(4)
 
         send_btn = QPushButton("发送")
         send_btn.setObjectName("primary")
@@ -540,7 +586,7 @@ class CommandItem(QFrame):
         close_btn.setStyleSheet(
             "QToolButton#cmdClose{background:transparent;border:0px;"
             "border-radius:6px;padding:0px;}"
-            "QToolButton#cmdClose:hover{background:rgba(199,75,92,0.12);}"
+            "QToolButton#cmdClose:hover{background:rgba(199,75,92,31);}"
         )
         close_btn.setIcon(icon("close", 18, "#7C8CA0"))
         close_btn.setIconSize(QSize(16, 16))
@@ -608,10 +654,13 @@ class CommandItem(QFrame):
                 self.badge.setStyleSheet("")
             return
         rgb = QColor(color)
+        if not rgb.isValid():
+            self.setStyleSheet("")
+            return
         r, g, b = rgb.red(), rgb.green(), rgb.blue()
         self.setStyleSheet(
-            f"QFrame#infoCard{{background:rgba({r},{g},{b},0.13);"
-            f"border:1px solid rgba({r},{g},{b},0.45);"
+            f"QFrame#infoCard{{background:rgba({r},{g},{b},{int(0.13*255)});"
+            f"border:1px solid rgba({r},{g},{b},{int(0.45*255)});"
             f"border-left:4px solid {color};"
             "border-radius:10px;}}"
         )
@@ -934,6 +983,23 @@ class CommandDialog(QDialog):
         group_hint.setWordWrap(True)
         slider_lay.addWidget(group_hint)
 
+        self.crc_combo = QComboBox()
+        self.crc_combo.addItems(CRC_NAMES)
+        current_crc = str(settings.get("crc", "none") or "none")
+        self.crc_combo.setCurrentIndex(
+            list(CRC_MODES).index(current_crc) if current_crc in CRC_MODES else 0
+        )
+        self.crc_row = self._row("CRC 校验", self.crc_combo)
+        slider_lay.addLayout(self.crc_row)
+        crc_hint = _label(
+            "自建滑动组专用：在数据之后、尾帧之前追加校验字节（CRC-16 为 Modbus 约定）。",
+            "tinyMuted",
+        )
+        crc_hint.setWordWrap(True)
+        slider_lay.addWidget(crc_hint)
+        self._sync_crc_visibility()
+        self.group_combo.currentTextChanged.connect(self._sync_crc_visibility)
+
         self.auto_send_check = QCheckBox("拖动时实时发送")
         self.auto_send_check.setChecked(bool(settings.get("auto_send", True)))
         slider_lay.addWidget(self.auto_send_check)
@@ -1016,6 +1082,26 @@ class CommandDialog(QDialog):
         slider = self.kind_combo.currentIndex() == 1
         self.fixed_box.setVisible(not slider)
         self.slider_box.setVisible(slider)
+        self._sync_crc_visibility()
+
+    def _sync_crc_visibility(self) -> None:
+        """CRC 只开放给自建滑动组（填写了绑定组），普通滑动条不可用。"""
+        if not hasattr(self, "crc_combo"):
+            return
+        enabled = (
+            self.kind_combo.currentIndex() == 1
+            and bool(self.group_combo.currentText().strip())
+        )
+        for widget in (self.crc_combo,):
+            widget.setEnabled(enabled)
+        row = getattr(self, "crc_row", None)
+        if row is not None:
+            for i in range(row.count()):
+                item = row.itemAt(i)
+                if item.widget() is not None:
+                    item.widget().setEnabled(enabled)
+        if not enabled:
+            self.crc_combo.setCurrentIndex(0)
 
     def _on_accept(self) -> None:
         for check, edit, name in (
@@ -1057,5 +1143,175 @@ class CommandDialog(QDialog):
             "head_text": self.head_edit.text(),
             "tail_enabled": self.tail_check.isChecked(),
             "tail_text": self.tail_edit.text(),
+            "crc": list(CRC_MODES)[self.crc_combo.currentIndex()]
+            if self.crc_combo.isEnabled()
+            else "none",
             "auto_send": self.auto_send_check.isChecked(),
+        }
+
+
+class CustomGroupDialog(QDialog):
+    """自建滑动组：一次配置组名、滑块数量、通用协议（头/尾帧/CRC）与每个通道的数据类型。
+
+    只有从这里创建的组才带 CRC 设置；普通「新增滑块组」不提供 CRC。
+    """
+
+    def __init__(self, groups: list[str], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("自建滑动组")
+        self.setMinimumWidth(520)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 14, 18, 14)
+        lay.setSpacing(10)
+
+        lay.addWidget(_label("自建滑动组", "sectionBlue"))
+        lay.addWidget(
+            _label(
+                "一次配置整组协议与数据类型，发送时自动拼帧并追加校验字节。",
+                "tinyMuted",
+            )
+        )
+
+        form = QHBoxLayout()
+        form.setSpacing(10)
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText(f"组{len(groups) + 1}")
+        form.addWidget(_label("组名"), 0)
+        form.addWidget(self.name_edit, 1)
+        self.count_spin = QSpinBox()
+        self.count_spin.setRange(1, 8)
+        self.count_spin.setValue(3)
+        self.count_spin.setFixedWidth(64)
+        form.addWidget(_label("滑块数"), 0)
+        form.addWidget(self.count_spin, 0)
+        lay.addLayout(form)
+
+        # 通用协议
+        lay.addWidget(_label("协议", "sectionBlue"))
+        self.head_check = QCheckBox("头帧")
+        self.head_edit = QLineEdit()
+        self.head_edit.setObjectName("mono")
+        self.head_edit.setPlaceholderText("AA 55  或  text:...")
+        self.head_check.toggled.connect(self.head_edit.setEnabled)
+        self.head_edit.setEnabled(False)
+        head_row = QHBoxLayout()
+        head_row.setSpacing(8)
+        head_row.addWidget(self.head_check)
+        head_row.addWidget(self.head_edit, 1)
+        lay.addLayout(head_row)
+
+        self.tail_check = QCheckBox("尾帧")
+        self.tail_edit = QLineEdit()
+        self.tail_edit.setObjectName("mono")
+        self.tail_edit.setPlaceholderText("0D 0A  或  text:\\r\\n")
+        self.tail_check.toggled.connect(self.tail_edit.setEnabled)
+        self.tail_edit.setEnabled(False)
+        tail_row = QHBoxLayout()
+        tail_row.setSpacing(8)
+        tail_row.addWidget(self.tail_check)
+        tail_row.addWidget(self.tail_edit, 1)
+        lay.addLayout(tail_row)
+
+        crc_row = QHBoxLayout()
+        crc_row.setSpacing(8)
+        self.crc_combo = QComboBox()
+        self.crc_combo.addItems(CRC_NAMES)
+        crc_row.addWidget(_label("CRC 校验"), 0)
+        crc_row.addWidget(self.crc_combo, 1)
+        self.endian_combo = QComboBox()
+        self.endian_combo.addItems(["小端 (LE)", "大端 (BE)"])
+        crc_row.addWidget(self.endian_combo, 0)
+        lay.addLayout(crc_row)
+
+        # 每个滑块的数据类型 / 范围
+        lay.addWidget(_label("滑块参数", "sectionBlue"))
+        self.rows: list[tuple[QLineEdit, QComboBox, QSpinBox, QSpinBox]] = []
+        self.rows_layout = QVBoxLayout()
+        self.rows_layout.setSpacing(6)
+        lay.addLayout(self.rows_layout)
+        self.count_spin.valueChanged.connect(self._rebuild_rows)
+        self._rebuild_rows()
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel = QPushButton("取消")
+        cancel.clicked.connect(self.reject)
+        ok = QPushButton("创建")
+        ok.setObjectName("primary")
+        ok.clicked.connect(self._on_accept)
+        buttons.addWidget(cancel)
+        buttons.addWidget(ok)
+        lay.addLayout(buttons)
+
+    def _rebuild_rows(self) -> None:
+        while self.rows_layout.count():
+            item = self.rows_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self.rows.clear()
+        for index in range(self.count_spin.value()):
+            name = QLineEdit(f"CH{index + 1}")
+            dtype = QComboBox()
+            dtype.addItems(DTYPE_NAMES)
+            lo = QSpinBox()
+            lo.setRange(-32768, 32767)
+            lo.setValue(-100)
+            hi = QSpinBox()
+            hi.setRange(-32768, 32767)
+            hi.setValue(100)
+            row = QHBoxLayout()
+            row.setSpacing(6)
+            row.addWidget(name, 1)
+            row.addWidget(dtype, 0)
+            row.addWidget(lo, 0)
+            row.addWidget(_label("~"), 0)
+            row.addWidget(hi, 0)
+            holder = QWidget()
+            holder.setLayout(row)
+            self.rows_layout.addWidget(holder)
+            self.rows.append((name, dtype, lo, hi))
+
+    def _on_accept(self) -> None:
+        for check, edit, label in (
+            (self.head_check, self.head_edit, "头帧"),
+            (self.tail_check, self.tail_edit, "尾帧"),
+        ):
+            if check.isChecked():
+                try:
+                    parse_frame_bytes(edit.text(), "utf-8")
+                except ValueError:
+                    self._warn(f"{label}的 hex: 写法不合法，请检查十六进制位数。")
+                    return
+        for _, _, lo, hi in self.rows:
+            if lo.value() >= hi.value():
+                self._warn("每个滑块的范围下限必须小于上限。")
+                return
+        self.accept()
+
+    @staticmethod
+    def _warn(text: str) -> None:
+        from PySide6.QtWidgets import QMessageBox
+
+        QMessageBox.warning(None, "设置无效", text)
+
+    def values(self) -> dict:
+        return {
+            "group": self.name_edit.text().strip(),
+            "count": self.count_spin.value(),
+            "head_enabled": self.head_check.isChecked(),
+            "head_text": self.head_edit.text(),
+            "tail_enabled": self.tail_check.isChecked(),
+            "tail_text": self.tail_edit.text(),
+            "crc": list(CRC_MODES)[self.crc_combo.currentIndex()],
+            "big_endian": self.endian_combo.currentIndex() == 1,
+            "channels": [
+                {
+                    "title": name.text().strip() or f"CH{i + 1}",
+                    "dtype": dtype.currentText(),
+                    "vmin": float(lo.value()),
+                    "vmax": float(hi.value()),
+                }
+                for i, (name, dtype, lo, hi) in enumerate(self.rows)
+            ],
         }

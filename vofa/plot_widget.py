@@ -690,8 +690,15 @@ class PlotPage(pg.PlotWidget):
         self.fft_summary.show()
 
     def _fit_view(self, x: np.ndarray, arrays: list[np.ndarray]) -> None:
-        """Auto：X 跟随最新窗口，Y 贴合可见数据并留 8% 边距（带轻微平滑）。"""
-        x0 = float(x[0])
+        """Auto：X 跟随最近一个显示窗口，Y 贴合可见数据并留 8% 边距。
+
+        连续记录模式仍保留/绘制完整历史，但视图只跟随最近 display_points
+        个采样点对应的时间窗（类似 VOFA+ 的滚动跟随），不会把全部历史塞进视野。
+        """
+        if self.unlimited and x.size > self.display_points:
+            x0 = float(x[-self.display_points])
+        else:
+            x0 = float(x[0])
         x1 = float(x[-1])
         if not math.isfinite(x0) or not math.isfinite(x1) or x1 - x0 <= 1e-9:
             x0, x1 = x0 - 1.0, x1 + 1.0
@@ -699,8 +706,10 @@ class PlotPage(pg.PlotWidget):
 
         if not arrays:
             return
-        ymin = min(float(np.min(a)) for a in arrays)
-        ymax = max(float(np.max(a)) for a in arrays)
+        # Y 也只按可见窗口计算，避免很早以前的大范围把当前曲线压扁
+        arrs = [a[-self.display_points:] for a in arrays]
+        ymin = min(float(np.min(a)) for a in arrs)
+        ymax = max(float(np.max(a)) for a in arrs)
         if not math.isfinite(ymin) or not math.isfinite(ymax):
             return
         if ymax - ymin <= 1e-9:
@@ -850,11 +859,9 @@ class PlotPage(pg.PlotWidget):
     def _visible_time_bounds(self) -> tuple[float | None, float | None]:
         if not self.times:
             return None, None
-        if self.unlimited:
-            values = list(self.times)
-        else:
-            shown = min(self.display_points, len(self.times))
-            values = list(self.times)[-shown:]
+        # 连续记录虽存完整历史，但游标/测量只对可见窗口操作
+        shown = min(self.display_points, len(self.times))
+        values = list(self.times)[-shown:]
         if len(values) < 3:
             return float(values[0]), float(values[-1])
         margin = max(1, len(values) // 12)

@@ -315,7 +315,7 @@ class SettingsDialog(QDialog):
         lay = vbox((18, 18, 18, 14), 10)
         lay.addWidget(make_label("布局配置", "sectionBlue"))
         lay.addWidget(
-            make_label("导出当前窗口布局为 JSON，下次可导入恢复。", "tinyMuted")
+            make_label("导出布局、命令面板与协议设置，下次导入即可整套恢复。", "tinyMuted")
         )
         buttons = hbox(spacing=8)
         export_btn = QPushButton("导出当前布局…")

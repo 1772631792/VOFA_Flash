@@ -549,7 +549,7 @@ QFrame#vline, QFrame#hr {
 }
 QLabel#versionPill {
     color: #1f67c7;
-    background: rgba(45, 126, 241, 0.10);
+    background: rgba(45, 126, 241, 26);
     border-radius: 9px;
     padding: 1px 8px;
     font-size: 11px;

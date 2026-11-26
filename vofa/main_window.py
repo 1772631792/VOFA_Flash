@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import sys
+
+if __package__ in (None, ""):
+    print("请用项目根目录的 main.py 启动：python main.py（不要直接运行子模块）")
+    sys.exit(1)
+
 import csv
 import json
 import math
+import random
 import re
 import struct
-import sys
 import time
 from typing import TYPE_CHECKING
 
@@ -54,7 +60,15 @@ from PySide6.QtWidgets import (
 )
 
 from . import __version__ as VERSION
-from .command_panel import CommandDialog, CommandItem, parse_frame_bytes
+from .command_panel import (
+    CRC_MODES,
+    CommandDialog,
+    CommandItem,
+    CustomGroupDialog,
+    crc_bytes,
+    dtype_limits,
+    parse_frame_bytes,
+)
 from .icons import app_icon, icon
 from .plot_widget import FFT_SCALES, FFT_WINDOWS, MAX_CHANNELS, PlotPage
 from .protocol import JustFloatParser
@@ -155,12 +169,16 @@ class MainWindow(QMainWindow):
         self.worker: SerialWorker | BaseTransport | None = None
         self.connected = False
         self.demo_enabled = False
-        self.sim_mode = str(load_setting("demo/mode", "sine", str))
-        if self.sim_mode not in ("sine", "step", "pid"):
-            self.sim_mode = "sine"
+        self.sim_mode = "sine"  # 每次启动固定从正弦（三角函数）开始，PID 需手动设定
         self.measure_dialog: MeasureDialog | None = None
         self._demo_step_period_ms = 4000.0
         self._demo_last_step_ms = 0.0
+        self._pid_gains = (2.5, 0.3, 0.25)  # P / I / D：默认留可见超调，D 调大可压掉
+        self._last_pid_gains = self._pid_gains
+        self._pid_target = 1.0  # 设定值，由 PID 组的“目标”滑块驱动
+        self._last_pid_target: float | None = None
+        self._pid_group = "PID"
+        self._pid_states = [self._new_pid_state(ch) for ch in range(DEMO_CHANNELS)]
         self.record_unlimited = False
         self.channel_names = [f"I{i}" for i in range(MAX_CHANNELS)]
         self.channel_colors = list(CHANNEL_COLORS)
@@ -556,7 +574,7 @@ class MainWindow(QMainWindow):
         add_btn.setIcon(icon("plus", 18, ICON_NEUTRAL))
         add_btn.setFixedSize(30, 30)
         add_btn.setIconSize(QSize(18, 18))
-        add_btn.setToolTip("新增固定命令 / 滑动条 / 滑块组")
+        add_btn.setToolTip("新增固定命令 / 滑动条 / 滑块组 / 自建滑动组（含 CRC）")
         add_btn.setPopupMode(QToolButton.InstantPopup)
         add_btn.setMenu(self._build_add_menu(add_btn))
         head.addWidget(add_btn)
@@ -571,7 +589,7 @@ class MainWindow(QMainWindow):
         self.cmd_inner = QWidget()
         self.cmd_layout = vbox((0, 0, 0, 0), 10)
         self.cmd_empty = make_label(
-            "暂无命令\n点击右上角 + 新增固定命令或滑动条", "emptyHint"
+            "暂无命令\n点击右上角 + 新增固定命令、滑动条或自建滑动组", "emptyHint"
         )
         self.cmd_empty.setAlignment(Qt.AlignCenter)
         self.cmd_empty.setWordWrap(True)
@@ -1375,6 +1393,9 @@ class MainWindow(QMainWindow):
             return
         self.sim_mode = mode
         save_setting("demo/mode", mode)
+        self._sync_pid_group()
+        if mode == "pid":
+            self._pid_states = [self._new_pid_state(ch) for ch in range(DEMO_CHANNELS)]
         self._demo_last_step_ms = 0.0
         self.clear_plot()
         for target in self.pages:
@@ -1451,6 +1472,8 @@ class MainWindow(QMainWindow):
         self.scale_label.setText(f"{per_div:.0f}ms/格")
 
     def generate_demo_data(self) -> None:
+        if self.sim_mode == "pid":
+            self._sync_pid_gains()
         rate = self.demo_rate_combo.int_value()
         channels = DEMO_CHANNELS
         per_frame = rate / 30.0
@@ -1462,7 +1485,7 @@ class MainWindow(QMainWindow):
         for k in range(frames):
             t = t0 + k * step
             t_ms = (self.sample_index + k) * self.dt_ms
-            if t_ms % self._demo_step_period_ms < self.dt_ms:
+            if self.sim_mode != "pid" and t_ms % self._demo_step_period_ms < self.dt_ms:
                 self._demo_last_step_ms = t_ms
             local_t = (t_ms - self._demo_last_step_ms) / 1000.0
             values = []
@@ -1475,10 +1498,59 @@ class MainWindow(QMainWindow):
                         + 0.18 * math.sin(2 * math.pi * 9.0 * t)
                         + ch * 0.6
                     )
+                elif self.sim_mode == "pid":
+                    # 真实闭环：每个采样点跑一步 PID + 对象积分
+                    value = self._pid_step(step, ch)
                 else:
                     value = self._demo_response(local_t, ch)
+                # 微小随机噪声：模拟真实采样抖动，不依赖外部数据源
+                value += random.gauss(0.0, 0.006)
                 values.append(value)
             self.append_values(values, from_demo=True)
+
+    @staticmethod
+    def _new_pid_state(ch: int) -> dict:
+        """二阶对象（质量-弹簧-阻尼）+ 离散 PID 的初始状态。
+
+        二阶对象上 P 决定刚度、D 直接加阻尼，超调变化明显；
+        三路对象阻尼略有差异，曲线不会重合。
+        """
+        return {
+            "y": 0.0,
+            "v": 0.0,
+            "integral": 0.0,
+            "d_filtered": 0.0,
+            "u": 0.0,
+            "c": 0.28 + ch * 0.08,  # 对象自然阻尼
+            "k": 0.5,  # 对象自然刚度（无控制器时回到 0）
+        }
+
+    def _pid_step(self, dt: float, ch: int) -> float:
+        """跑一步真实闭环：测量 → PID → 执行器限幅 → 二阶对象积分。"""
+        state = self._pid_states[ch]
+        kp, ki, kd = self._pid_gains
+        error = self._pid_target - state["y"]
+
+        # 测量值微分（对象速度），低通滤波抑制噪声放大
+        alpha = dt / (dt + 0.012) if dt > 0 else 1.0
+        state["d_filtered"] += alpha * (state["v"] - state["d_filtered"])
+
+        state["integral"] += error * dt
+        state["integral"] = max(-5.0, min(5.0, state["integral"]))
+
+        u = kp * error + ki * state["integral"] - kd * state["d_filtered"]
+        u_raw = u
+        u = max(-8.0, min(8.0, u))
+        # 反算抗饱和
+        if u != u_raw and ki > 1e-6:
+            state["integral"] += (u - u_raw) / ki
+        state["u"] = u
+
+        # 二阶对象：y'' = (u - c*y' - k*y) / m，半隐式欧拉积分
+        accel = u - state["c"] * state["v"] - state["k"] * state["y"]
+        state["v"] += accel * dt
+        state["y"] += state["v"] * dt
+        return state["y"]
 
     def _demo_response(self, t: float, ch: int) -> float:
         """阶跃 / PID 模拟：带超调与衰减振荡的二阶响应，便于直接测量性能指标。"""
@@ -1487,12 +1559,16 @@ class MainWindow(QMainWindow):
         amp = 1.2 + ch * 0.45
         if x <= 0.0:
             return 0.0
+        p_gain, i_gain, d_gain = self._pid_gains
         if self.sim_mode == "step":
             wn = 2 * math.pi * (1.6 + ch * 0.15)
             zeta = 0.42
         else:
-            wn = 2 * math.pi * (2.2 + ch * 0.2)
-            zeta = 0.26
+            # 目标值即阶跃设定值；P 加快响应，D 增加阻尼，I 抑制稳态误差
+            amp = self._pid_target * (1.0 + ch * 0.04)
+            wn = 2 * math.pi * (1.4 + 0.9 * p_gain + ch * 0.15)
+            zeta = max(0.12, min(0.95, 0.34 + 0.16 * d_gain - 0.06 * i_gain))
+            amp *= 1.0 / (1.0 + 0.12 * i_gain)
         wd = wn * math.sqrt(1.0 - zeta * zeta)
         response = 1.0 - math.exp(-zeta * wn * x) * (
             math.cos(wd * x) + (zeta * wn / wd) * math.sin(wd * x)
@@ -1777,6 +1853,7 @@ class MainWindow(QMainWindow):
         self.set_plot_paused(False, message=False)
         self._reset_variables(reset_style=True)
         self._sync_param_panel(name)
+        self._sync_pid_group()
         if name == "模拟模式":
             self.demo_enabled = False
             self._set_link_state(False)
@@ -2464,7 +2541,7 @@ class MainWindow(QMainWindow):
         ]
         payload = {
             "format": "vofa-flash-layout",
-            "version": 2,
+            "version": 3,
             "window": {"geometry": bytes(self.saveGeometry()).hex()},
             "appearance": {"dark": self.dark},
             "plot": {
@@ -2485,6 +2562,28 @@ class MainWindow(QMainWindow):
                 "data_collapsed": self._data_collapsed,
             },
             "channels": channels,
+            "debug": {
+                "engine": self.engine_name,
+                "commands": [item.settings() for item in self._command_widgets()],
+                "group_colors": dict(self._group_colors),
+                "serial": {
+                    "bits": self.serial_bits,
+                    "parity": self.serial_parity,
+                    "stopbits": self.serial_stopbits,
+                    "flow": self.serial_flow,
+                    "auto_reconnect": self.auto_reconnect,
+                    "baud": self.baud_combo.currentText(),
+                },
+                "network": {
+                    "host": self.net_host_edit.text(),
+                    "port": self.net_port_spin.value(),
+                },
+                "encoding": self.encoding,
+                "hex_mode": self.hex_mode,
+                "rx_hex_mode": self.rx_hex_mode,
+                "ending": self.ending_combo.currentIndex(),
+                "sim_mode": self.sim_mode,
+            },
         }
         try:
             with open(path, "w", encoding="utf-8") as fh:
@@ -2611,6 +2710,77 @@ class MainWindow(QMainWindow):
             apply_sizes(self.center_splitter, panels.get("center"))
             apply_sizes(self.center_vsplit, panels.get("vertical"))
             apply_sizes(self.plot_splitter, plot.get("splitter"))
+
+            debug = data.get("debug", {})
+            if isinstance(debug, dict):
+                engine = str(debug.get("engine", self.engine_name))
+                if engine in ENGINES:
+                    self.engine_combo.setCurrentText(engine)
+                serial_cfg = debug.get("serial", {})
+                if isinstance(serial_cfg, dict):
+                    self.serial_bits = int(serial_cfg.get("bits", self.serial_bits))
+                    self.serial_parity = str(serial_cfg.get("parity", self.serial_parity))
+                    self.serial_stopbits = int(serial_cfg.get("stopbits", self.serial_stopbits))
+                    self.serial_flow = str(serial_cfg.get("flow", self.serial_flow))
+                    self.auto_reconnect = bool(
+                        serial_cfg.get("auto_reconnect", self.auto_reconnect)
+                    )
+                    baud = str(serial_cfg.get("baud", ""))
+                    if baud:
+                        self.baud_combo.setCurrentText(baud)
+                    self._update_serial_fmt_text()
+                    self._build_serial_fmt_menu()
+                net_cfg = debug.get("network", {})
+                if isinstance(net_cfg, dict):
+                    self.net_host_edit.setText(
+                        str(net_cfg.get("host", self.net_host_edit.text()))
+                    )
+                    self.net_port_spin.setValue(
+                        int(net_cfg.get("port", self.net_port_spin.value()))
+                    )
+                codec = str(debug.get("encoding", self.encoding))
+                if codec in ("utf-8", "gbk", "ascii"):
+                    self.encoding = codec
+                    label = {"utf-8": "UTF-8", "gbk": "GBK", "ascii": "ASCII"}[codec]
+                    self.encoding_btn.setText(f"⌁ {label}")
+                self.hex_mode = bool(debug.get("hex_mode", self.hex_mode))
+                self._sync_tx_mode_ui()
+                self.rx_hex_mode = bool(debug.get("rx_hex_mode", self.rx_hex_mode))
+                self._sync_rx_mode_ui()
+                self.ending_combo.setCurrentIndex(
+                    max(0, min(2, int(debug.get("ending", self.ending_combo.currentIndex()))))
+                )
+                sim_mode = str(debug.get("sim_mode", self.sim_mode))
+                if sim_mode in ("sine", "step", "pid"):
+                    self.sim_mode = sim_mode
+                colors = debug.get("group_colors", {})
+                if isinstance(colors, dict):
+                    self._group_colors = {
+                        str(key): str(value) for key, value in colors.items()
+                    }
+                commands = debug.get("commands", [])
+                if isinstance(commands, list):
+                    for widget in self._command_widgets():
+                        widget.setParent(None)
+                        widget.deleteLater()
+                    for cfg in commands:
+                        if not isinstance(cfg, dict) or cfg.get("kind") not in (
+                            "fixed",
+                            "slider",
+                        ):
+                            continue
+                        try:
+                            item = self.add_command(
+                                str(cfg["kind"]),
+                                str(cfg.get("content", "")),
+                                str(cfg.get("title") or ""),
+                            )
+                            item.apply_settings(cfg)
+                        except (TypeError, ValueError):
+                            continue
+                    self._update_command_hint()
+                    self._apply_group_styles()
+                    self._refresh_command_previews()
         except (KeyError, TypeError, ValueError, AttributeError) as exc:
             QMessageBox.warning(self, "导入失败", f"布局文件无法解析：{exc}")
             return
@@ -2845,6 +3015,7 @@ class MainWindow(QMainWindow):
         menu.addAction("新增固定命令", lambda: self.add_command("fixed"))
         menu.addAction("新增滑动条", lambda: self.add_command("slider"))
         menu.addSeparator()
+        menu.addAction("自建滑动组…", self.add_custom_group)
         for count in (2, 3, 4):
             menu.addAction(
                 f"新增滑块组（{count} 个）",
@@ -2933,6 +3104,121 @@ class MainWindow(QMainWindow):
         self._refresh_command_previews()
         self.statusBar().showMessage(f"已新增滑块组 {group}（{count} 个滑块）", 3000)
 
+    def add_custom_group(self) -> None:
+        """从 + 菜单自建滑动组：统一配置协议、CRC 与每个通道的数据类型。"""
+        dialog = CustomGroupDialog(self._command_groups(), self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        cfg = dialog.values()
+        group = cfg["group"] or f"组{self._next_auto_number('组', self._command_groups())}"
+        for index, channel in enumerate(cfg["channels"]):
+            item = self.add_command("slider")
+            data = item.settings()
+            data.update(
+                {
+                    "title": channel["title"],
+                    "group": group,
+                    "dtype": channel["dtype"],
+                    "big_endian": cfg["big_endian"],
+                    "vmin": channel["vmin"],
+                    "vmax": channel["vmax"],
+                    "step": max((channel["vmax"] - channel["vmin"]) / 100, 0.001),
+                    "value": channel["vmin"],
+                    "head_enabled": cfg["head_enabled"],
+                    "head_text": cfg["head_text"],
+                    "tail_enabled": cfg["tail_enabled"],
+                    "tail_text": cfg["tail_text"],
+                    "crc": cfg["crc"],
+                }
+            )
+            # 整数类型的范围要在类型可表示范围内，避免 spin 被截断
+            lo, hi = dtype_limits(channel["dtype"])
+            data["vmin"] = max(data["vmin"], lo)
+            data["vmax"] = min(data["vmax"], hi)
+            if data["vmax"] <= data["vmin"]:
+                data["vmin"], data["vmax"] = lo, hi
+            item.apply_settings(data)
+        self._apply_group_styles()
+        self._refresh_command_previews()
+        crc_label = CRC_MODES[cfg["crc"]][0] if cfg["crc"] in CRC_MODES else "无"
+        self.statusBar().showMessage(
+            f"已自建滑动组 {group}（{len(cfg['channels'])} 个滑块，CRC: {crc_label}）", 4000
+        )
+
+    def _sync_pid_group(self) -> None:
+        """PID 滑块组只在「模拟模式 + PID 响应」时存在，其它情况自动移除。"""
+        wanted = self.interface_name == "模拟模式" and self.sim_mode == "pid"
+        members = [
+            item
+            for item in self._command_widgets()
+            if item.kind == "slider" and item.group == self._pid_group
+        ]
+        if not wanted:
+            for item in members:
+                item.setParent(None)
+                item.deleteLater()
+            if members:
+                self._update_command_hint()
+                self._apply_group_styles()
+                self._refresh_command_previews()
+            return
+        if members:
+            return
+        self.add_slider_group(
+            count=4,
+            head_text="text:S",
+            tail_text="text:E",
+            group=self._pid_group,
+        )
+        members = [
+            item
+            for item in self._command_widgets()
+            if item.kind == "slider" and item.group == self._pid_group
+        ]
+        specs = (
+            ("目标", self._pid_target, 0.0, 10.0),
+            ("P", self._pid_gains[0], 0.0, 3.0),
+            ("I", self._pid_gains[1], 0.0, 5.0),
+            ("D", self._pid_gains[2], 0.0, 2.0),
+        )
+        for item, (title, value, vmin, vmax) in zip(members[-4:], specs):
+            data = item.settings()
+            data.update(
+                {
+                    "title": title,
+                    "dtype": "float32",
+                    "vmin": vmin,
+                    "vmax": vmax,
+                    "step": 0.01,
+                    "decimals": 3,
+                    "value": value,
+                }
+            )
+            item.apply_settings(data)
+        self._apply_group_styles()
+        self._refresh_command_previews()
+
+    def _sync_pid_gains(self) -> None:
+        """每帧从 PID 组读取 P/I/D，让拖动滑块直接改变模拟曲线。"""
+        members = [
+            item
+            for item in self._command_widgets()
+            if item.kind == "slider" and item.group == self._pid_group
+        ]
+        if len(members) < 4:
+            return
+        values: dict[str, float] = {}
+        for item in members:
+            key = item.title.strip()
+            if key in ("目标", "P", "I", "D"):
+                values[key] = item.numeric_value()
+        if len(values) < 4:
+            return
+        # 只更新参数与设定值，绝不重置对象状态：真实对象的位置/速度不会瞬间归零，
+        # 曲线必须从当前值连续过渡到新目标。
+        self._pid_gains = (values["P"], values["I"], values["D"])
+        self._pid_target = values["目标"]
+
     def _edit_command(self, item: CommandItem) -> None:
         dialog = CommandDialog(
             item.settings(), self._command_groups(), self.hex_mode, self
@@ -2951,6 +3237,7 @@ class MainWindow(QMainWindow):
                         "head_text": item.head_text,
                         "tail_enabled": item.tail_enabled,
                         "tail_text": item.tail_text,
+                        "crc": item.crc,
                     }
                 )
                 member.apply_settings(data)
@@ -3028,7 +3315,8 @@ class MainWindow(QMainWindow):
             head = members[0].head_bytes(self.encoding)
             tail = members[0].tail_bytes(self.encoding)
             body = b"".join(member.pack_payload() for member in members)
-            return head + body + tail
+            crc = crc_bytes(members[0].crc, head + body) if members[0].crc != "none" else b""
+            return head + body + crc + tail
         except ValueError:
             if not silent:
                 QMessageBox.warning(
